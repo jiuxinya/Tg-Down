@@ -86,6 +86,10 @@ case "$(uname -s)" in
     # 实测 MinGW gcc 报 conflicting types。）
     sed -i 's/^extern int getopt ();$/extern int getopt (int argc, char *const *argv, const char *optstring);/' \
       td/generate/tl-parser/wgetopt.h
+    # 同类问题第二处：wgetopt.c 自带旧式无参声明（非 glibc 时 stdlib.h 不会被包含），
+    # 与 CRT 的 getenv(const char*) 原型冲突，wgetopt.c:401 调用报参数过多。
+    sed -i 's/^extern char \*getenv();$/extern char *getenv (const char *);/' \
+      td/generate/tl-parser/wgetopt.c
     ;;
 esac
 
