@@ -75,6 +75,18 @@ cd "$SRC"
 git fetch origin "$TDLIB_COMMIT" 2>/dev/null || git fetch --all --tags || true
 git checkout -f "$TDLIB_COMMIT"
 
+case "$(uname -s)" in
+  MINGW* | MSYS*)
+    # MinGW 下的 tl-parser 编译缺陷：tlc.c 在 _WIN32 下不包含 <unistd.h>，改经
+    # tl-parser.h → wgetopt.h 拿 getopt 声明；而 wgetopt.h 只认 glibc 的
+    # __GNU_LIBRARY__，MinGW 未定义它，落到旧式无参原型 `extern int getopt ();`，
+    # tlc.c:115 的三参调用直接报 "too many arguments to function 'getopt'"。
+    # MinGW 同样提供带完整原型的 <unistd.h>（两种声明在 C 里兼容），补上包含即可。
+    sed -i 's/^#ifndef _WIN32$/#if !defined(_WIN32) || defined(__MINGW32__)/' \
+      td/generate/tl-parser/tlc.c
+    ;;
+esac
+
 rm -rf build
 mkdir build
 cd build
