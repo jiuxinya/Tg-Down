@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,22 +25,31 @@ type fakeClient struct {
 	calls          map[string]int
 	counts         map[int64]int64
 	countErrs      map[int64]error
-	recordFn       func(context.Context, downloader.RecordEvent)
+	countCalls     map[int64]int
+	cancelGates    map[string]chan struct{}
+	recordFn       func(context.Context, *downloader.RecordEvent)
 	scanProgressFn func(taskID string, scannedMessages, foundMedia, scanCursor int64)
 	dupLookupFn    func(ctx context.Context, uniqueID string) (string, bool)
 	specs          map[string][]downloader.HistorySpec
+	failedMedia    map[string]int64
+	maxMessageIDs  map[string]int64
 	monitorTaskID  string
 	monitorChatID  int64
+	monitorTitle   string
 }
 
 func newFakeClient() *fakeClient {
 	return &fakeClient{
-		gates:     make(map[string]chan struct{}),
-		errs:      make(map[string]error),
-		calls:     make(map[string]int),
-		counts:    make(map[int64]int64),
-		countErrs: make(map[int64]error),
-		specs:     make(map[string][]downloader.HistorySpec),
+		gates:         make(map[string]chan struct{}),
+		errs:          make(map[string]error),
+		calls:         make(map[string]int),
+		counts:        make(map[int64]int64),
+		countErrs:     make(map[int64]error),
+		countCalls:    make(map[int64]int),
+		cancelGates:   make(map[string]chan struct{}),
+		specs:         make(map[string][]downloader.HistorySpec),
+		failedMedia:   make(map[string]int64),
+		maxMessageIDs: make(map[string]int64),
 	}
 }
 
@@ -90,13 +100,16 @@ func (f *fakeClient) setCountErr(chatID int64, err error) {
 func (f *fakeClient) CountHistoryMedia(_ context.Context, chatID int64, _ []string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.countCalls[chatID]++
 	if err := f.countErrs[chatID]; err != nil {
 		return 0, err
 	}
 	return f.counts[chatID], nil
 }
 
-func (f *fakeClient) DownloadHistoryMedia(ctx context.Context, spec *downloader.HistorySpec) error {
+func (f *fakeClient) DownloadHistoryMedia(
+	ctx context.Context, spec *downloader.HistorySpec,
+) (*downloader.HistoryResult, error) {
 	taskID := spec.TaskID
 	f.mu.Lock()
 	f.calls[taskID]++
@@ -106,23 +119,63 @@ func (f *fakeClient) DownloadHistoryMedia(ctx context.Context, spec *downloader.
 	select {
 	case <-f.gate(taskID):
 	case <-ctx.Done():
-		return ctx.Err()
+		f.mu.Lock()
+		cancelGate := f.cancelGates[taskID]
+		f.mu.Unlock()
+		if cancelGate != nil {
+			<-cancelGate
+		}
+		return &downloader.HistoryResult{}, ctx.Err()
 	}
 
 	f.mu.Lock()
 	err := f.errs[taskID]
+	// 失败计数一次性消费：本轮报告 N 个文件失败，后续重试轮即为干净运行
+	result := &downloader.HistoryResult{Failed: f.failedMedia[taskID], MaxMessageID: f.maxMessageIDs[taskID]}
+	delete(f.failedMedia, taskID)
 	f.mu.Unlock()
-	return err
+	return result, err
 }
 
-func (f *fakeClient) SetMonitorTask(taskID string, chatID int64) {
+func (f *fakeClient) blockCancel(id string) chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gate := make(chan struct{})
+	f.cancelGates[id] = gate
+	return gate
+}
+
+func (f *fakeClient) setMaxMessageID(id string, messageID int64) {
+	f.mu.Lock()
+	f.maxMessageIDs[id] = messageID
+	f.mu.Unlock()
+}
+
+// setFailedMedia 让指定任务的下一次下载运行返回 n 个单文件失败（任务级 err 仍为 nil）
+func (f *fakeClient) setFailedMedia(id string, n int64) {
+	f.mu.Lock()
+	f.failedMedia[id] = n
+	f.mu.Unlock()
+}
+
+// specsFor 返回指定任务各轮运行收到的 spec（按顺序）
+func (f *fakeClient) specsFor(id string) []downloader.HistorySpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]downloader.HistorySpec, len(f.specs[id]))
+	copy(out, f.specs[id])
+	return out
+}
+
+func (f *fakeClient) SetMonitorTask(taskID string, chatID int64, chatTitle string) {
 	f.mu.Lock()
 	f.monitorTaskID = taskID
 	f.monitorChatID = chatID
+	f.monitorTitle = chatTitle
 	f.mu.Unlock()
 }
 
-func (f *fakeClient) SetRecordFunc(fn func(context.Context, downloader.RecordEvent)) {
+func (f *fakeClient) SetRecordFunc(fn func(context.Context, *downloader.RecordEvent)) {
 	f.mu.Lock()
 	f.recordFn = fn
 	f.mu.Unlock()
@@ -298,7 +351,7 @@ func TestCancel_QueuedTask(t *testing.T) {
 
 // TestCancel_QueuedTask_DoneClosedOnce 验证排队中任务被取消时 done 立即关闭（cancelTask 的
 // StatusQueued 分支），且该任务后续被 worker 从 historyCh 取出触发 runHistoryTask 的早退路径时，
-// 对同一 done 的第二次 markDone 不会 panic（sync.Once 保证幂等）
+// 对同一 done 的第二次 markDone 不会 panic（doneClosed 保证幂等）
 func TestCancel_QueuedTask_DoneClosedOnce(t *testing.T) {
 	m, fc := newTestManager(t, 1)
 
@@ -339,6 +392,72 @@ func TestCancel_QueuedTask_DoneClosedOnce(t *testing.T) {
 	}
 }
 
+func TestWaitForQueuedCancelIncludesFinalNotification(t *testing.T) {
+	m, fc := newTestManager(t, 1)
+	first, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, m, first.ID, StatusRunning, testWaitTimeout)
+	second, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 2}, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	notifyStarted := make(chan struct{})
+	releaseNotify := make(chan struct{})
+	m.SetOnChange(func(dto *TaskDTO) {
+		if dto.ID == second.ID && Status(dto.Status) == StatusCanceled {
+			close(notifyStarted)
+			<-releaseNotify
+		}
+	})
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- m.Cancel(second.ID) }()
+	select {
+	case <-notifyStarted:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("queued cancellation did not reach final notification")
+	}
+	row, err := m.store.GetTask(context.Background(), second.ID)
+	if err != nil || row == nil || row.Status != string(StatusCanceled) || row.FinishedAt == nil {
+		t.Fatalf("queued cancellation was not persisted before notification: row=%+v err=%v", row, err)
+	}
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- m.Wait(context.Background(), second.ID) }()
+	fc.release(first.ID)
+	waitForStatus(t, m, first.ID, StatusCompleted, testWaitTimeout)
+	deadline := time.Now().Add(testWaitTimeout)
+	for len(m.historyCh) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not consume the canceled queued task")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-waitDone:
+		t.Fatalf("Wait returned before final notification completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseNotify)
+	if err := <-cancelDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(testWaitTimeout):
+		t.Fatal("Wait did not return after queued cancellation finished")
+	}
+	if calls := fc.callCount(second.ID); calls != 0 {
+		t.Fatalf("canceled queued task ran %d times", calls)
+	}
+}
+
 // TestCancel_RunningTask 验证取消运行中的任务会取消其 ctx 并最终落定为 canceled
 func TestCancel_RunningTask(t *testing.T) {
 	m, fc := newTestManager(t, 1)
@@ -354,6 +473,63 @@ func TestCancel_RunningTask(t *testing.T) {
 	}
 	waitForStatus(t, m, dto.ID, StatusCanceled, testWaitTimeout)
 	_ = fc // gate intentionally never released; cancellation must unblock via ctx
+}
+
+func TestWaitBlocksUntilCanceledTaskCleanupCompletes(t *testing.T) {
+	m, fc := newTestManager(t, 1)
+	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, m, dto.ID, StatusRunning, testWaitTimeout)
+	cleanupGate := fc.blockCancel(dto.ID)
+	if err := m.Cancel(dto.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- m.Wait(context.Background(), dto.ID) }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("Wait returned before downloader cleanup completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(cleanupGate)
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(testWaitTimeout):
+		t.Fatal("Wait did not return after downloader cleanup completed")
+	}
+	got, _ := m.Get(dto.ID)
+	if Status(got.Status) != StatusCanceled {
+		t.Fatalf("task status after Wait = %s", got.Status)
+	}
+}
+
+func TestWaitHonorsContextAndRejectsUnknownTask(t *testing.T) {
+	m, fc := newTestManager(t, 1)
+	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, m, dto.ID, StatusRunning, testWaitTimeout)
+	waitCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.Wait(waitCtx, dto.ID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait(canceled context) error = %v", err)
+	}
+	if err := m.Wait(context.Background(), "missing"); err == nil || !strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("Wait(missing) error = %v", err)
+	}
+	if err := m.Cancel(dto.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, m, dto.ID, StatusCanceled, testWaitTimeout)
+	_ = fc
 }
 
 // TestRetry_FailedTask 验证重试失败任务会以新 ID 重新入队并真正再次执行
@@ -570,7 +746,7 @@ func TestNewManager_ResumesInterruptedTasksFromStore(t *testing.T) {
 	interrupted := &store.TaskRow{
 		ID: "old-1", Kind: string(KindHistory), ChatID: 1, ChatTitle: "chat-1",
 		Status: string(StatusRunning), CreatedAt: time.Now().Add(-2 * time.Minute),
-		ScanCursor: 777,
+		ScanCursor: 777, StopAtMessageID: 555, ScheduleID: "schedule-old",
 	}
 	if err := st.CreateTask(ctx, interrupted); err != nil {
 		t.Fatalf("CreateTask(interrupted) error = %v", err)
@@ -606,6 +782,11 @@ func TestNewManager_ResumesInterruptedTasksFromStore(t *testing.T) {
 	if list[2].Status != string(StatusQueued) {
 		t.Fatalf("中断的 history 任务应重置为 queued 待恢复，got status=%s", list[2].Status)
 	}
+	waitCtx, stopWait := context.WithTimeout(context.Background(), testWaitTimeout)
+	defer stopWait()
+	if err := m.Wait(waitCtx, "new-1"); err != nil {
+		t.Fatalf("Wait(restored terminal task) error = %v", err)
+	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -619,8 +800,9 @@ func TestNewManager_ResumesInterruptedTasksFromStore(t *testing.T) {
 	specs := fc.specs["old-1"]
 	monitorTaskID, monitorChatID := fc.monitorTaskID, fc.monitorChatID
 	fc.mu.Unlock()
-	if len(specs) != 1 || specs[0].FromMessageID != 777 {
-		t.Fatalf("恢复任务应携带持久化游标 777, got specs=%+v", specs)
+	if len(specs) != 1 || specs[0].FromMessageID != 777 ||
+		specs[0].StopAtMessageID != 555 || specs[0].ScheduleID != "schedule-old" {
+		t.Fatalf("恢复任务未携带完整的持久化运行参数: %+v", specs)
 	}
 
 	// monitor 任务自动恢复：同一 id 重新关联 client
@@ -661,8 +843,8 @@ func TestHandleRecordEvent_AsyncPersistPreservesOrder(t *testing.T) {
 		MediaType: "photo", FileName: "a.jpg", FileSize: 100,
 	}
 	ctx := context.Background()
-	recordFn(ctx, downloader.RecordEvent{Media: media, Status: downloader.RecordStarted, FilePath: "/tmp/a.jpg"})
-	recordFn(ctx, downloader.RecordEvent{Media: media, Status: downloader.RecordCompleted, FilePath: "/tmp/a.jpg"})
+	recordFn(ctx, &downloader.RecordEvent{Media: media, Status: downloader.RecordQueued, FilePath: "/tmp/a.jpg"})
+	recordFn(ctx, &downloader.RecordEvent{Media: media, Status: downloader.RecordCompleted, FilePath: "/tmp/a.jpg"})
 
 	deadline := time.Now().Add(testWaitTimeout)
 	var recs []*store.HistoryRecord
@@ -776,6 +958,22 @@ func TestEnqueue_FiltersFlowThroughSpecAndRetry(t *testing.T) {
 	}
 }
 
+func TestTaskFiltersDoNotAliasCallerOrDTO(t *testing.T) {
+	m := NewManager(newFakeClient(), newTestStore(t), logger.New(logger.LevelError), 1, 0)
+	filters := downloader.HistoryFilters{MediaTypes: []string{"photo"}}
+	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1, Filters: filters}, "chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filters.MediaTypes[0] = "video"
+	dto.Filters.MediaTypes[0] = "document"
+
+	got, ok := m.Get(dto.ID)
+	if !ok || got.Filters == nil || len(got.Filters.MediaTypes) != 1 || got.Filters.MediaTypes[0] != "photo" {
+		t.Fatalf("internal filters were mutated through an external snapshot: %+v", got.Filters)
+	}
+}
+
 // TestFireDueSchedules 验证定时计划：到期触发入队并更新 last_run；
 // 未到期/运行中重叠时不重复触发
 func TestFireDueSchedules(t *testing.T) {
@@ -828,4 +1026,391 @@ func TestFireDueSchedules(t *testing.T) {
 
 	fc.release(taskID)
 	waitForStatus(t, m, taskID, StatusCompleted, testWaitTimeout)
+}
+
+func TestHistoryCountSkippedForUnsupportedFilters(t *testing.T) {
+	fc := newFakeClient()
+	fc.setCount(1, 500)
+	m := NewManager(fc, newTestStore(t), logger.New(logger.LevelError), 1, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go m.Run(ctx)
+
+	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{
+		ChatID: 1, Filters: downloader.HistoryFilters{DateFrom: 1700000000, Query: "report"},
+	}, "chat-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(testWaitTimeout)
+	for fc.callCount(dto.ID) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("filtered task did not reach the download phase")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	got, _ := m.Get(dto.ID)
+	if got.ExpectedTotal != 0 {
+		t.Fatalf("filtered task ExpectedTotal = %d, want unknown (0)", got.ExpectedTotal)
+	}
+	fc.mu.Lock()
+	countCalls := fc.countCalls[1]
+	fc.mu.Unlock()
+	if countCalls != 0 {
+		t.Fatalf("inexact CountHistoryMedia called %d times", countCalls)
+	}
+	fc.release(dto.ID)
+	waitForStatus(t, m, dto.ID, StatusCompleted, testWaitTimeout)
+}
+
+func TestEnqueueHistoryQueueFullReturnsAndRollsBack(t *testing.T) {
+	st := newTestStore(t)
+	m := NewManager(newFakeClient(), st, logger.New(logger.LevelError), 1, 0)
+	for i := 0; i < historyQueueBuffer; i++ {
+		if _, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: int64(i + 1)}, "queued"); err != nil {
+			t.Fatalf("fill queue at %d: %v", i, err)
+		}
+	}
+
+	type result struct {
+		dto TaskDTO
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: historyQueueBuffer + 1}, "overflow")
+		done <- result{dto: dto, err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err == nil || !strings.Contains(got.err.Error(), "队列已满") {
+			t.Fatalf("overflow enqueue = (%+v, %v)", got.dto, got.err)
+		}
+	case <-time.After(testWaitTimeout):
+		t.Fatal("overflow enqueue blocked instead of returning an error")
+	}
+
+	if got := len(m.List()); got != historyQueueBuffer {
+		t.Fatalf("in-memory task count = %d, want %d", got, historyQueueBuffer)
+	}
+	rows, err := st.ListTasks(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rows); got != historyQueueBuffer {
+		t.Fatalf("persisted task count = %d, want %d", got, historyQueueBuffer)
+	}
+}
+
+func TestScheduleWatermarkAdvancesOnlyAfterCompleteSuccess(t *testing.T) {
+	fc := newFakeClient()
+	st := newTestStore(t)
+	m := NewManager(fc, st, logger.New(logger.LevelError), 1, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go m.Run(ctx)
+	if err := st.CreateSchedule(ctx, &store.ScheduleRow{
+		ID: "s-water", ChatID: 7, IntervalMin: 10, Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateScheduleLastMaxID(ctx, "s-water", 100); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(chatID int64, resultMax, failed int64, runErr error, want Status) {
+		t.Helper()
+		dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{
+			ChatID: chatID, StopAtMessageID: 100, ScheduleID: "s-water",
+		}, "scheduled")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fc.setMaxMessageID(dto.ID, resultMax)
+		fc.setFailedMedia(dto.ID, failed)
+		if runErr != nil {
+			fc.setErr(dto.ID, runErr)
+		}
+		fc.release(dto.ID)
+		waitForStatus(t, m, dto.ID, want, testWaitTimeout)
+	}
+
+	run(7, 200, 0, errors.New("scan failed"), StatusFailed)
+	rows, _ := st.ListSchedules(ctx)
+	if rows[0].LastMaxID != 100 {
+		t.Fatalf("watermark advanced after task error: %d", rows[0].LastMaxID)
+	}
+	run(8, 250, 1, nil, StatusPartial)
+	rows, _ = st.ListSchedules(ctx)
+	if rows[0].LastMaxID != 100 {
+		t.Fatalf("watermark advanced after media failure: %d", rows[0].LastMaxID)
+	}
+	run(9, 300, 0, nil, StatusCompleted)
+	rows, _ = st.ListSchedules(ctx)
+	if rows[0].LastMaxID != 300 {
+		t.Fatalf("watermark after complete success = %d, want 300", rows[0].LastMaxID)
+	}
+}
+
+func TestRunShutdownKeepsHistoryAndMonitorRecoverable(t *testing.T) {
+	fc := newFakeClient()
+	st := newTestStore(t)
+	m := NewManager(fc, st, logger.New(logger.LevelError), 1, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		m.Run(ctx)
+		close(runDone)
+	}()
+
+	history, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, m, history.ID, StatusRunning, testWaitTimeout)
+	monitor, err := m.Enqueue(KindMonitor, &downloader.HistorySpec{ChatID: 2}, "monitor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, m, monitor.ID, StatusRunning, testWaitTimeout)
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("Manager.Run did not wait for task shutdown")
+	}
+	historyRow, err := st.GetTask(context.Background(), history.ID)
+	if err != nil || historyRow == nil || historyRow.Status != string(StatusQueued) {
+		t.Fatalf("history task not recoverable after shutdown: row=%+v err=%v", historyRow, err)
+	}
+	monitorRow, err := st.GetTask(context.Background(), monitor.ID)
+	if err != nil || monitorRow == nil || monitorRow.Status != string(StatusRunning) {
+		t.Fatalf("monitor task not recoverable after shutdown: row=%+v err=%v", monitorRow, err)
+	}
+}
+
+func TestShutdownRacingEnqueueNeverLeavesSuccessfulTaskUnwaitable(t *testing.T) {
+	fc := newFakeClient()
+	st := newTestStore(t)
+	m := NewManager(fc, st, logger.New(logger.LevelError), 4, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		m.Run(ctx)
+		close(runDone)
+	}()
+	seed, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const contenders = 64
+	start := make(chan struct{})
+	type enqueueResult struct {
+		dto TaskDTO
+		err error
+	}
+	results := make(chan enqueueResult, contenders)
+	var wg sync.WaitGroup
+	for i := 0; i < contenders; i++ {
+		wg.Add(1)
+		go func(chatID int64) {
+			defer wg.Done()
+			<-start
+			dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: chatID}, "race")
+			results <- enqueueResult{dto: dto, err: err}
+		}(int64(i + 2))
+	}
+	close(start)
+	cancel()
+	wg.Wait()
+	close(results)
+	select {
+	case <-runDone:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("Manager.Run did not finish during enqueue race")
+	}
+
+	succeeded := []string{seed.ID}
+	for result := range results {
+		if result.err == nil {
+			succeeded = append(succeeded, result.dto.ID)
+		}
+	}
+	for _, id := range succeeded {
+		waitCtx, stopWait := context.WithTimeout(context.Background(), testWaitTimeout)
+		err := m.Wait(waitCtx, id)
+		stopWait()
+		if err != nil {
+			t.Fatalf("successful enqueue %s remained unwaitable after shutdown: %v", id, err)
+		}
+		row, err := st.GetTask(context.Background(), id)
+		if err != nil || row == nil {
+			t.Fatalf("successful enqueue %s is not recoverable: row=%+v err=%v", id, row, err)
+		}
+	}
+	if _, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 999}, "stopped"); err == nil {
+		t.Fatal("enqueue after shutdown unexpectedly succeeded")
+	}
+}
+
+func TestBeginDrainBlocksNewWorkAtTaskSnapshotBoundary(t *testing.T) {
+	m := NewManager(newFakeClient(), newTestStore(t), logger.New(logger.LevelError), 1, 0)
+	queued, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "queued")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addPartialTaskForRetryTest(t, m, "partial-drain")
+	ids, err := m.BeginDrain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != queued.ID {
+		t.Fatalf("BeginDrain() ids = %v, want [%s]", ids, queued.ID)
+	}
+	if _, err := m.BeginDrain(); err == nil {
+		t.Fatal("second BeginDrain unexpectedly succeeded")
+	}
+	if _, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 2}, "blocked"); err == nil {
+		t.Fatal("Enqueue succeeded while draining")
+	}
+	if _, err := m.Retry("partial-drain"); err == nil {
+		t.Fatal("Retry succeeded while draining")
+	}
+	beforeSchedule := len(m.List())
+	if err := m.store.CreateSchedule(context.Background(), &store.ScheduleRow{
+		ID: "drain-schedule", ChatID: 3, IntervalMin: MinScheduleIntervalMin,
+		Enabled: true, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.fireDueSchedules(context.Background())
+	if got := len(m.List()); got != beforeSchedule {
+		t.Fatalf("scheduler added work while draining: before=%d after=%d", beforeSchedule, got)
+	}
+	schedules, err := m.store.ListSchedules(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(schedules) != 1 || schedules[0].LastRun != nil {
+		t.Fatalf("scheduler advanced last_run while draining: %+v", schedules)
+	}
+	if err := m.Cancel(queued.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Wait(context.Background(), queued.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.EndDrain(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 2}, "resumed"); err != nil {
+		t.Fatalf("Enqueue after EndDrain: %v", err)
+	}
+}
+
+func TestRunReturnRejectsLateRecordWithoutPersistence(t *testing.T) {
+	m := NewManager(newFakeClient(), newTestStore(t), logger.New(logger.LevelError), 1, 0)
+	var recorderCalls int
+	m.recorder = func(context.Context, *downloader.RecordEvent) { recorderCalls++ }
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		m.Run(ctx)
+		close(runDone)
+	}()
+	deadline := time.Now().Add(testWaitTimeout)
+	for {
+		m.mu.Lock()
+		started := m.runCtx != nil
+		m.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Manager.Run did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("Manager.Run did not stop")
+	}
+
+	eventDone := make(chan struct{})
+	go func() {
+		m.handleRecordEvent(context.Background(), &downloader.RecordEvent{
+			Media:  &downloader.MediaInfo{TaskID: "late", ChatID: 1, MessageID: 1},
+			Status: downloader.RecordQueued,
+		})
+		close(eventDone)
+	}()
+	select {
+	case <-eventDone:
+	case <-time.After(testWaitTimeout):
+		t.Fatal("late record event blocked after Manager.Run returned")
+	}
+	if recorderCalls != 0 || len(m.recordCh) != 0 {
+		t.Fatalf("late event persisted or entered a dead queue: calls=%d queued=%d", recorderCalls, len(m.recordCh))
+	}
+}
+
+func TestCorruptPersistedFiltersAreNotRecoveredOrRetried(t *testing.T) {
+	st := newTestStore(t)
+	if err := st.CreateTask(context.Background(), &store.TaskRow{
+		ID: "bad-filter", Kind: string(KindHistory), ChatID: 1, Status: string(StatusRunning),
+		CreatedAt: time.Now(), Filters: `{broken`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fc := newFakeClient()
+	m := NewManager(fc, st, logger.New(logger.LevelError), 1, 0)
+	dto, ok := m.Get("bad-filter")
+	if !ok || Status(dto.Status) != StatusFailed || !strings.Contains(dto.Error, "过滤器") {
+		t.Fatalf("corrupt task was not failed safely: %+v", dto)
+	}
+	row, _ := st.GetTask(context.Background(), "bad-filter")
+	if row.Status != string(StatusFailed) {
+		t.Fatalf("corrupt task store status = %s", row.Status)
+	}
+	if _, err := m.Retry("bad-filter"); err == nil || !strings.Contains(err.Error(), "参数损坏") {
+		t.Fatalf("Retry(corrupt task) error = %v", err)
+	}
+	if calls := fc.callCount("bad-filter"); calls != 0 {
+		t.Fatalf("corrupt task unexpectedly ran %d times", calls)
+	}
+}
+
+func TestFireDueSchedulesSkipsInvalidPersistedValues(t *testing.T) {
+	fc := newFakeClient()
+	st := newTestStore(t)
+	m := NewManager(fc, st, logger.New(logger.LevelError), 1, 0)
+	ctx := context.Background()
+	rows := []*store.ScheduleRow{
+		{ID: "zero", ChatID: 1, IntervalMin: 0, Filters: "", Enabled: true, CreatedAt: time.Now()},
+		{ID: "huge", ChatID: 2, IntervalMin: int(MaxScheduleIntervalMin + 1), Enabled: true, CreatedAt: time.Now()},
+		{ID: "json", ChatID: 3, IntervalMin: 10, Filters: `{broken`, Enabled: true, CreatedAt: time.Now()},
+		{ID: "semantic", ChatID: 4, IntervalMin: 10, Filters: `{"media_types":["bogus"]}`, Enabled: true, CreatedAt: time.Now()},
+	}
+	for _, row := range rows {
+		if err := st.CreateSchedule(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.fireDueSchedules(ctx)
+	if got := len(m.List()); got != 0 {
+		t.Fatalf("invalid schedules created %d tasks", got)
+	}
+	stored, err := st.ListSchedules(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range stored {
+		if row.LastRun != nil {
+			t.Errorf("invalid schedule %s unexpectedly updated last_run", row.ID)
+		}
+	}
 }

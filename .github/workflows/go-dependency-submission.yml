@@ -4,25 +4,22 @@ on:
     branches:
       - main
       - master
-  pull_request:
-    branches:
-      - main
-      - master
-
 # API需要对仓库的写权限来提交依赖信息
 permissions:
-  contents: write
+  contents: read
 
 # 配置Go和Go模块的环境变量
 env:
   GOPROXY: 'https://proxy.golang.org,direct'
   GOPRIVATE: ''
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.25.12'
 
 jobs:
   go-dependency-submission:
     runs-on: ubuntu-latest
     name: Submit Go Dependencies
+    permissions:
+      contents: write
     steps:
       - name: 'Checkout Repository'
         uses: actions/checkout@v6

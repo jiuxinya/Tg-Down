@@ -42,6 +42,16 @@ type Config struct {
 	JitterFactor float64
 	ShouldRetry  func(error) bool
 	OnRetry      func(attempt int, err error, delay time.Duration)
+
+	// RetryAfter 从错误中提取服务端指定的等待时长（如 Telegram 的 FLOOD_WAIT）。
+	// 命中时直接采用该时长，不套用指数退避——服务端给的是指令，不是建议：等得比它短会
+	// 立刻再次被限流，等得比它长则白白浪费时间。返回 false 表示该错误无服务端指定时长。
+	// 本包不感知具体协议，由调用方（telegram）注入。
+	RetryAfter func(error) (time.Duration, bool)
+
+	// MaxRetryAfter 限制 RetryAfter 可接受的最大等待时长。超过此值说明限流窗口过长，
+	// 与其占着下载槽空等数小时，不如直接失败让上层重试机制接手。
+	MaxRetryAfter time.Duration
 }
 
 // DefaultConfig returns a default retry configuration
@@ -94,6 +104,27 @@ type Retrier struct {
 	logger *logger.Logger
 }
 
+// serverRetryAfter 返回服务端指定的等待时长。
+//
+// abort 为真表示服务端要求的等待超过 MaxRetryAfter：必须就地放弃，交由上层任务级重试处理，
+// 避免下载槽被长时间空占。**不能只是返回 ok=false**——限流错误在 ShouldRetry 那里是"可重试"的
+// （见 telegram.tdShouldRetry：429/420 返回 true），退回去只会让它按几秒的指数退避继续打
+// 一个刚刚明确要求等一小时的服务端，把限流拖得更久。
+func (r *Retrier) serverRetryAfter(err error) (delay time.Duration, ok, abort bool) {
+	if r.config.RetryAfter == nil {
+		return 0, false, false
+	}
+	d, has := r.config.RetryAfter(err)
+	if !has || d <= 0 {
+		return 0, false, false
+	}
+	if r.config.MaxRetryAfter > 0 && d > r.config.MaxRetryAfter {
+		r.logger.Warn("服务端要求等待 %v，超过上限 %v，放弃重试", d, r.config.MaxRetryAfter)
+		return 0, false, true
+	}
+	return d, true, false
+}
+
 // New creates a new retrier with the given configuration
 func New(config *Config, logger *logger.Logger) *Retrier {
 	if config == nil {
@@ -133,8 +164,12 @@ func (r *Retrier) Do(ctx context.Context, fn func() error) error {
 
 		lastErr = err
 
-		// Check if we should retry this error
-		if !r.config.ShouldRetry(err) {
+		// 服务端指定了等待时长（FLOOD_WAIT）：无条件视为可重试，且用它给的时长
+		serverDelay, hasServerDelay, abort := r.serverRetryAfter(err)
+		if abort {
+			return err
+		}
+		if !hasServerDelay && !r.config.ShouldRetry(err) {
 			r.logger.Debug("Error not retryable: %v", err)
 			return err
 		}
@@ -144,8 +179,10 @@ func (r *Retrier) Do(ctx context.Context, fn func() error) error {
 			break
 		}
 
-		// Calculate delay with exponential backoff and jitter
 		delay := r.calculateDelay(attempt)
+		if hasServerDelay {
+			delay = serverDelay
+		}
 
 		// Call retry callback
 		if r.config.OnRetry != nil {
@@ -192,6 +229,27 @@ func (r *Retrier) calculateDelay(attempt int) time.Duration {
 	}
 
 	return time.Duration(delay)
+}
+
+// WithClassifier 注入协议感知的错误分类器：shouldRetry 判定是否可重试，retryAfter 提取
+// 服务端指定的等待时长（任一为 nil 时保留原值）。maxRetryAfter 为可接受的最长等待。
+func (r *Retrier) WithClassifier(
+	shouldRetry func(error) bool,
+	retryAfter func(error) (time.Duration, bool),
+	maxRetryAfter time.Duration,
+) *Retrier {
+	newConfig := *r.config
+	if shouldRetry != nil {
+		newConfig.ShouldRetry = shouldRetry
+	}
+	if retryAfter != nil {
+		newConfig.RetryAfter = retryAfter
+	}
+	newConfig.MaxRetryAfter = maxRetryAfter
+	return &Retrier{
+		config: &newConfig,
+		logger: r.logger,
+	}
 }
 
 // WithMaxRetries creates a new retrier with updated max retries

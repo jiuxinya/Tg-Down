@@ -29,9 +29,9 @@ type task struct {
 	chatTitle string
 	createdAt time.Time
 	done      chan struct{} // 任务终结时关闭（经 markDone），monitor 切换时用于等待旧任务停止
-	closeOnce sync.Once     // 保证 done 只被关闭一次：排队取消与执行方退出可能竞争同一任务的终结路径
 
 	mu            sync.Mutex
+	doneClosed    bool // 与 done 一起受 mu 保护；部分重试会安装一个全新的完成通道
 	status        Status
 	errMsg        string
 	startedAt     *time.Time
@@ -45,13 +45,17 @@ type task struct {
 	foundMedia      int64                     // 历史扫描累计发现的媒体数（仅内存态，运行中有值）
 	scanCursor      int64                     // 历史扫描游标（持久化，重启恢复续扫起点）
 	attempts        int                       // 自动重试已消耗次数（持久化）
-	resumed         bool                      // 本任务是否为进程重启后恢复（需补下中断行）
+	resumed         bool                      // 本任务是否为进程重启后恢复
+	retryFailedOnly bool                      // 本次运行只补下失败文件，跳过历史扫描（历史已完整扫过）
+	stopAtMessageID int64                     // 增量扫描下界（定时任务：只扫比上次水位更新的消息）
+	scheduleID      string                    // 触发本任务的定时计划（非空时完成后回写增量水位）（需补下中断行）
 	filters         downloader.HistoryFilters // 任务级过滤条件（持久化，零值 = 不过滤）
 	messageID       int64                     // 单消息任务的目标消息 id（持久化，0 = 整聊天）
 	lastScanNotify  time.Time                 // 上次扫描进度对外推送时刻，用于限频
 
 	lastRecordNotify      time.Time // 上次下载记录对外推送时刻，用于限频
 	recordTrailingPending bool      // 是否已排定一次尾随推送（限频窗口内多次更新只排一次）
+	restoreErr            string    // 持久化运行参数损坏时阻止自动恢复和无过滤重试
 }
 
 // scanNotifyMinGap 是扫描进度对外推送（SSE）的最小间隔：
@@ -63,49 +67,89 @@ const scanNotifyMinGap = 500 * time.Millisecond
 // 不限频会向浏览器灌入成百上千条消息造成前端卡顿
 const recordNotifyMinGap = 250 * time.Millisecond
 
-// newTask 创建一个初始状态为 queued 的任务；spec 携带 ChatID/Filters/MessageID
+// newTask 创建一个初始状态为 queued 的任务；spec 携带 ChatID/Filters/MessageID 与定时增量信息
 func newTask(kind Kind, spec *downloader.HistorySpec, chatTitle string) *task {
 	return &task{
-		id:        generateID(),
-		kind:      kind,
-		chatID:    spec.ChatID,
-		chatTitle: chatTitle,
-		createdAt: time.Now(),
-		done:      make(chan struct{}),
-		status:    StatusQueued,
-		filters:   spec.Filters,
-		messageID: spec.MessageID,
+		id:              generateID(),
+		kind:            kind,
+		chatID:          spec.ChatID,
+		chatTitle:       chatTitle,
+		createdAt:       time.Now(),
+		done:            make(chan struct{}),
+		status:          StatusQueued,
+		filters:         cloneHistoryFilters(spec.Filters),
+		messageID:       spec.MessageID,
+		stopAtMessageID: spec.StopAtMessageID,
+		scheduleID:      spec.ScheduleID,
 	}
+}
+
+func cloneHistoryFilters(filters downloader.HistoryFilters) downloader.HistoryFilters {
+	filters.MediaTypes = append([]string(nil), filters.MediaTypes...)
+	return filters
 }
 
 // markDone 关闭 done 通道，多次调用安全；由任务终结的唯一执行路径调用
 func (t *task) markDone() {
-	t.closeOnce.Do(func() { close(t.done) })
+	t.mu.Lock()
+	if !t.doneClosed {
+		close(t.done)
+		t.doneClosed = true
+	}
+	t.mu.Unlock()
+}
+
+// markDoneIfQueued 关闭关停后仍保持 queued 的本轮完成信号。返回 true 表示本次完成了关闭。
+func (t *task) markDoneIfQueued() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.status != StatusQueued || t.doneClosed {
+		return false
+	}
+	close(t.done)
+	t.doneClosed = true
+	return true
 }
 
 // taskFromRow 是 ToDTO 的逆操作，从持久化行重建进程重启后的内存任务；
-// done/closeOnce 属于进程本地状态，无法持久化，此处总是全新初始化
-func taskFromRow(row *store.TaskRow) *task {
+// done/doneClosed 属于进程本地状态，无法持久化，此处总是全新初始化
+func taskFromRow(row *store.TaskRow) (*task, error) {
 	var filters downloader.HistoryFilters
 	if row.Filters != "" {
-		_ = json.Unmarshal([]byte(row.Filters), &filters) // 解析失败退化为不过滤
+		if err := json.Unmarshal([]byte(row.Filters), &filters); err != nil {
+			t := taskFromRowValues(row, filters)
+			t.restoreErr = fmt.Sprintf("任务过滤器 JSON 损坏: %v", err)
+			return t, fmt.Errorf("%s", t.restoreErr)
+		}
+		if problem := filters.Validate(); problem != "" {
+			t := taskFromRowValues(row, filters)
+			t.restoreErr = "任务过滤器无效: " + problem
+			return t, fmt.Errorf("%s", t.restoreErr)
+		}
 	}
+	return taskFromRowValues(row, filters), nil
+}
+
+func taskFromRowValues(row *store.TaskRow, filters downloader.HistoryFilters) *task {
 	return &task{
-		id:            row.ID,
-		kind:          Kind(row.Kind),
-		chatID:        row.ChatID,
-		chatTitle:     row.ChatTitle,
-		createdAt:     row.CreatedAt,
-		done:          make(chan struct{}),
-		status:        Status(row.Status),
-		errMsg:        row.Error,
-		startedAt:     row.StartedAt,
-		finishedAt:    row.FinishedAt,
-		expectedTotal: row.ExpectedTotal,
-		scanCursor:    row.ScanCursor,
-		attempts:      row.Attempts,
-		filters:       filters,
-		messageID:     row.MessageID,
+		id:              row.ID,
+		kind:            Kind(row.Kind),
+		chatID:          row.ChatID,
+		chatTitle:       row.ChatTitle,
+		createdAt:       row.CreatedAt,
+		done:            make(chan struct{}),
+		status:          Status(row.Status),
+		errMsg:          row.Error,
+		startedAt:       row.StartedAt,
+		finishedAt:      row.FinishedAt,
+		expectedTotal:   row.ExpectedTotal,
+		scanCursor:      row.ScanCursor,
+		attempts:        row.Attempts,
+		filters:         filters,
+		messageID:       row.MessageID,
+		stopAtMessageID: row.StopAtMessageID,
+		scheduleID:      row.ScheduleID,
+		retryFailedOnly: row.RetryFailedOnly,
 		stats: downloader.Stats{
 			Total:          row.Total,
 			Downloaded:     row.Downloaded,
@@ -133,9 +177,14 @@ func (t *task) filtersJSON() string {
 func (t *task) ToDTO() TaskDTO {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.toDTOLocked()
+}
+
+// toDTOLocked 返回任务快照；调用方必须已持有 t.mu。
+func (t *task) toDTOLocked() TaskDTO {
 	var filters *downloader.HistoryFilters
 	if !t.filters.IsZero() {
-		f := t.filters
+		f := cloneHistoryFilters(t.filters)
 		filters = &f
 	}
 	return TaskDTO{
@@ -157,6 +206,9 @@ func (t *task) ToDTO() TaskDTO {
 		FoundMedia:      t.foundMedia,
 		ScanCursor:      t.scanCursor,
 		Attempts:        t.attempts,
+		StopAtMessageID: t.stopAtMessageID,
+		ScheduleID:      t.scheduleID,
+		RetryFailedOnly: t.retryFailedOnly,
 	}
 }
 
@@ -201,16 +253,21 @@ func (t *task) clearRecordTrailing() {
 	t.mu.Unlock()
 }
 
-// applyRecordEvent 按下载事件更新任务统计，增量规则与 downloader.DownloadStats 保持一致：
-// RecordStarted/RecordSkipped 各计一次 Total（互斥触发，不会重复计数同一媒体项）。
-func (t *task) applyRecordEvent(evt downloader.RecordEvent) {
+// applyRecordEvent 按下载事件更新任务统计。
+//
+// 事件契约（见 downloader.DownloadMedia）：每个媒体恰好一次 RecordQueued，随后恰好一次终态
+// 事件。因此 Total 只在入队时累加，终态事件各自累加自己的计数，恒有
+// Total = Downloaded + Failed + Skipped（全部终结后）。
+func (t *task) applyRecordEvent(evt *downloader.RecordEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	switch evt.Status {
-	case downloader.RecordStarted:
-		t.stats.Total++
+	case downloader.RecordQueued:
+		// RetryOnly 补的是本任务已经计入 Total 的失败文件，不能重复增加总数。
+		if !t.retryFailedOnly {
+			t.stats.Total++
+		}
 	case downloader.RecordSkipped:
-		t.stats.Total++
 		t.stats.Skipped++
 	case downloader.RecordCompleted:
 		t.stats.Downloaded++

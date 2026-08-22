@@ -13,3 +13,5 @@ config.yaml
 *.log
 .vscode/
 .idea/
+web/node_modules/
+internal/web/static/dist/

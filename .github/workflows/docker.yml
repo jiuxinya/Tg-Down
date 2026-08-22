@@ -93,14 +93,26 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create multi-arch manifest
+        id: manifest
         working-directory: /tmp/digests
         run: |
-          TAGS="-t ${IMAGE}:latest"
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            TAGS="$TAGS -t ${IMAGE}:${{ github.ref_name }}"
+            REF="${{ github.ref_name }}"
+            TAGS="-t ${IMAGE}:${REF}"
+            INSPECT_REF="${IMAGE}:${REF}"
+            # 与 release.yml 的预发布判定一致：带 '-' 的 tag 不更新生产 latest。
+            if [[ "$REF" != *-* ]]; then
+              TAGS="$TAGS -t ${IMAGE}:latest"
+            fi
+          else
+            # 手动构建只发布可追踪的临时 tag，不改动 latest。
+            REF="manual-${GITHUB_SHA::12}"
+            TAGS="-t ${IMAGE}:${REF}"
+            INSPECT_REF="${IMAGE}:${REF}"
           fi
           docker buildx imagetools create $TAGS \
             $(printf "${IMAGE}@sha256:%s " *)
+          echo "inspect_ref=$INSPECT_REF" >> "$GITHUB_OUTPUT"
 
       - name: Inspect
-        run: docker buildx imagetools inspect "${IMAGE}:latest"
+        run: docker buildx imagetools inspect "${{ steps.manifest.outputs.inspect_ref }}"

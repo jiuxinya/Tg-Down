@@ -4,9 +4,11 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
-	"strings"
 
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
@@ -42,11 +44,14 @@ const (
 	// 进制转换基数
 	DecimalBase  = 10
 	FloatBitSize = 64
+	// MaxTelegramAPIID 是 TDLib int32 字段可接受的最大 API ID。
+	MaxTelegramAPIID = 1<<31 - 1
 )
 
 // Config 应用配置结构
 type Config struct {
 	API      APIConfig      `yaml:"api"`
+	Telegram TelegramConfig `yaml:"telegram"`
 	Download DownloadConfig `yaml:"download"`
 	Chat     ChatConfig     `yaml:"chat"`
 	Log      LogConfig      `yaml:"log"`
@@ -72,6 +77,19 @@ type APIConfig struct {
 	Phone string `yaml:"phone"`
 }
 
+// TelegramConfig Telegram 连接配置
+type TelegramConfig struct {
+	// Proxy 是 TDLib 连接 Telegram 使用的代理。TDLib 不读 HTTP_PROXY/HTTPS_PROXY
+	// 等环境变量，服务器所在网络无法直连 Telegram 时必须在此显式配置（issue #49）。
+	// 支持格式：
+	//   socks5://[user:pass@]host:port
+	//   http://[user:pass@]host:port   （HTTP CONNECT，https:// 写法也按此处理）
+	//   mtproto://secret@host:port
+	// 留空时回退环境变量 TG_PROXY > ALL_PROXY > HTTPS_PROXY > HTTP_PROXY；
+	// 设为 direct / off / none 可在存在上述环境变量时强制直连。
+	Proxy string `yaml:"proxy"`
+}
+
 // DownloadConfig 下载配置
 type DownloadConfig struct {
 	Path          string `yaml:"path"`
@@ -82,6 +100,10 @@ type DownloadConfig struct {
 	SaveMetadata bool `yaml:"save_metadata"`
 	// DisableClassifyByType 为 true 时关闭按媒体类型归档（默认归档开启）
 	DisableClassifyByType bool `yaml:"disable_classify_by_type"`
+	// PathTemplate 是落盘路径模板，空 = downloader.DefaultPathTemplate（即 v2.x 的既有布局）。
+	// 可用占位符：{chat_id} {chat_title} {type} {album} {date} {msg_id} {sender} {name} {ext}，
+	// 必须包含 {chat_id}，并至少包含 {name} 或 {msg_id}（否则跨聊天或同聊天文件会互相覆盖）。
+	PathTemplate string `yaml:"path_template"`
 }
 
 // RetryConfig 重试配置
@@ -141,7 +163,9 @@ func LoadConfigForWeb() (*Config, error) {
 
 func load(requireAPI bool) (*Config, error) {
 	// 尝试加载 .env 文件
-	_ = godotenv.Load()
+	if err := loadDotEnv(); err != nil {
+		return nil, err
+	}
 
 	config := &Config{}
 
@@ -151,7 +175,9 @@ func load(requireAPI bool) (*Config, error) {
 	}
 
 	// 从环境变量覆盖配置
-	loadFromEnv(config)
+	if err := loadFromEnv(config); err != nil {
+		return nil, err
+	}
 	warnRemovedEnv()
 
 	// 设置默认值
@@ -167,18 +193,114 @@ func load(requireAPI bool) (*Config, error) {
 	return config, nil
 }
 
+func loadDotEnv() error {
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(".env")
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o077 != 0 {
+			if err := os.Chmod(".env", FilePermission); err != nil {
+				return fmt.Errorf("收紧 .env 文件权限失败: %w", err)
+			}
+		} else if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("检查 .env 文件失败: %w", err)
+		}
+	}
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("加载 .env 文件失败: %w", err)
+	}
+	return nil
+}
+
+// LoadSessionDir 只读取清理本地 TDLib 会话所需的目录。
+// API 凭据或其他数值配置损坏时，--clear-session 仍必须可用。
+func LoadSessionDir() (string, error) {
+	if err := loadDotEnv(); err != nil {
+		return "", err
+	}
+
+	var subset struct {
+		Session SessionConfig `yaml:"session"`
+	}
+	data, err := os.ReadFile("config.yaml")
+	if err == nil {
+		if err := yaml.Unmarshal(data, &subset); err != nil {
+			return "", fmt.Errorf("解析配置文件失败: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("读取配置文件失败: %w", err)
+	}
+
+	dir := subset.Session.Dir
+	if envDir := os.Getenv("SESSION_DIR"); envDir != "" {
+		dir = envDir
+	}
+	if dir == "" {
+		dir = DefaultSessionDir
+	}
+	return dir, nil
+}
+
 // HasAPICredentials 判断 API 凭据（id/hash/phone）是否齐全
 func (c *Config) HasAPICredentials() bool {
-	return c.API.ID != 0 && c.API.Hash != "" && c.API.Phone != ""
+	return IsValidAPIID(int64(c.API.ID)) && IsValidAPIHash(c.API.Hash) && IsValidPhone(c.API.Phone)
+}
+
+// IsValidAPIID 报告 API ID 是否能安全传给 TDLib 的 int32 字段。
+func IsValidAPIID(apiID int64) bool {
+	return apiID > 0 && apiID <= MaxTelegramAPIID
+}
+
+// IsValidAPIHash 报告 API Hash 是否为 Telegram 要求的 32 位十六进制字符串。
+func IsValidAPIHash(hash string) bool {
+	if len(hash) != 32 {
+		return false
+	}
+	for i := range len(hash) {
+		c := hash[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsValidPhone 报告手机号是否符合 E.164 的基本格式：+ 后跟 7 到 15 位数字，首位不能为 0。
+func IsValidPhone(phone string) bool {
+	if len(phone) < 8 || len(phone) > 16 || phone[0] != '+' || phone[1] < '1' || phone[1] > '9' {
+		return false
+	}
+	for i := 2; i < len(phone); i++ {
+		if phone[i] < '0' || phone[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // loadFromYAML 从YAML文件加载配置
 func loadFromYAML(config *Config) error {
-	if _, err := os.Stat("config.yaml"); err != nil {
-		return nil // 文件不存在，跳过
+	f, err := os.Open("config.yaml")
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("读取配置文件失败: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("检查配置文件失败: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("配置文件 config.yaml 不是普通文件")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		if err := f.Chmod(FilePermission); err != nil {
+			return fmt.Errorf("收紧配置文件权限失败: %w", err)
+		}
 	}
 
-	data, err := os.ReadFile("config.yaml")
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return fmt.Errorf("读取配置文件失败: %w", err)
 	}
@@ -225,34 +347,51 @@ func warnRemoved(msg string) {
 }
 
 // loadFromEnv 从环境变量加载配置
-func loadFromEnv(config *Config) {
-	loadAPIConfig(config)
-	loadDownloadConfig(config)
-	loadChatConfig(config)
+func loadFromEnv(config *Config) error {
+	if err := loadAPIConfig(config); err != nil {
+		return err
+	}
+	if err := loadDownloadConfig(config); err != nil {
+		return err
+	}
+	if err := loadChatConfig(config); err != nil {
+		return err
+	}
 	loadLogConfig(config)
 	loadSessionConfig(config)
-	loadRetryConfig(config)
-	loadQueueConfig(config)
+	if err := loadRetryConfig(config); err != nil {
+		return err
+	}
+	if err := loadQueueConfig(config); err != nil {
+		return err
+	}
 	loadStoreConfig(config)
-	loadNotifyConfig(config)
+	return loadNotifyConfig(config)
 }
 
 // loadNotifyConfig 加载通知配置
-func loadNotifyConfig(config *Config) {
+func loadNotifyConfig(config *Config) error {
 	if v := os.Getenv("NOTIFY_TELEGRAM_SELF"); v != "" {
-		config.Notify.TelegramSelf = v == "1" || strings.EqualFold(v, "true")
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return invalidEnv("NOTIFY_TELEGRAM_SELF", v, err)
+		}
+		config.Notify.TelegramSelf = enabled
 	}
 	if v := os.Getenv("NOTIFY_WEBHOOK_URL"); v != "" {
 		config.Notify.WebhookURL = v
 	}
+	return nil
 }
 
 // loadAPIConfig 加载API配置
-func loadAPIConfig(config *Config) {
+func loadAPIConfig(config *Config) error {
 	if apiID := os.Getenv("API_ID"); apiID != "" {
-		if id, err := strconv.Atoi(apiID); err == nil {
-			config.API.ID = id
+		id, err := strconv.Atoi(apiID)
+		if err != nil {
+			return invalidEnv("API_ID", apiID, err)
 		}
+		config.API.ID = id
 	}
 
 	if apiHash := os.Getenv("API_HASH"); apiHash != "" {
@@ -262,44 +401,59 @@ func loadAPIConfig(config *Config) {
 	if phone := os.Getenv("PHONE"); phone != "" {
 		config.API.Phone = phone
 	}
+	return nil
 }
 
 // loadDownloadConfig 加载下载配置
-func loadDownloadConfig(config *Config) {
+func loadDownloadConfig(config *Config) error {
 	if downloadPath := os.Getenv("DOWNLOAD_PATH"); downloadPath != "" {
 		config.Download.Path = downloadPath
 	}
 
 	if maxConcurrent := os.Getenv("MAX_CONCURRENT_DOWNLOADS"); maxConcurrent != "" {
-		if maxValue, err := strconv.Atoi(maxConcurrent); err == nil {
-			config.Download.MaxConcurrent = maxValue
+		maxValue, err := strconv.Atoi(maxConcurrent)
+		if err != nil {
+			return invalidEnv("MAX_CONCURRENT_DOWNLOADS", maxConcurrent, err)
 		}
+		config.Download.MaxConcurrent = maxValue
 	}
 
 	if batchSize := os.Getenv("BATCH_SIZE"); batchSize != "" {
-		if batch, err := strconv.Atoi(batchSize); err == nil {
-			config.Download.BatchSize = batch
+		batch, err := strconv.Atoi(batchSize)
+		if err != nil {
+			return invalidEnv("BATCH_SIZE", batchSize, err)
 		}
+		config.Download.BatchSize = batch
 	}
 
 	if partitionSize := os.Getenv("PARTITION_SIZE"); partitionSize != "" {
-		if partition, err := strconv.Atoi(partitionSize); err == nil {
-			config.Download.PartitionSize = partition
+		partition, err := strconv.Atoi(partitionSize)
+		if err != nil {
+			return invalidEnv("PARTITION_SIZE", partitionSize, err)
 		}
+		config.Download.PartitionSize = partition
 	}
 
 	if saveMetadata := os.Getenv("SAVE_METADATA"); saveMetadata != "" {
-		config.Download.SaveMetadata = saveMetadata == "1" || strings.EqualFold(saveMetadata, "true")
+		enabled, err := strconv.ParseBool(saveMetadata)
+		if err != nil {
+			return invalidEnv("SAVE_METADATA", saveMetadata, err)
+		}
+		config.Download.SaveMetadata = enabled
 	}
+	return nil
 }
 
 // loadChatConfig 加载聊天配置
-func loadChatConfig(config *Config) {
+func loadChatConfig(config *Config) error {
 	if targetChatID := os.Getenv("TARGET_CHAT_ID"); targetChatID != "" {
-		if chatID, err := strconv.ParseInt(targetChatID, DecimalBase, FloatBitSize); err == nil {
-			config.Chat.TargetID = chatID
+		chatID, err := strconv.ParseInt(targetChatID, DecimalBase, FloatBitSize)
+		if err != nil {
+			return invalidEnv("TARGET_CHAT_ID", targetChatID, err)
 		}
+		config.Chat.TargetID = chatID
 	}
+	return nil
 }
 
 // loadLogConfig 加载日志配置
@@ -317,38 +471,54 @@ func loadSessionConfig(config *Config) {
 }
 
 // loadRetryConfig 加载重试配置
-func loadRetryConfig(config *Config) {
+func loadRetryConfig(config *Config) error {
 	if maxRetries := os.Getenv("MAX_RETRIES"); maxRetries != "" {
-		if retries, err := strconv.Atoi(maxRetries); err == nil {
-			config.Retry.MaxRetries = retries
+		retries, err := strconv.Atoi(maxRetries)
+		if err != nil {
+			return invalidEnv("MAX_RETRIES", maxRetries, err)
 		}
+		config.Retry.MaxRetries = retries
 	}
 
 	if baseDelay := os.Getenv("BASE_DELAY"); baseDelay != "" {
-		if delay, err := strconv.Atoi(baseDelay); err == nil {
-			config.Retry.BaseDelay = delay
+		delay, err := strconv.Atoi(baseDelay)
+		if err != nil {
+			return invalidEnv("BASE_DELAY", baseDelay, err)
 		}
+		config.Retry.BaseDelay = delay
 	}
 
 	if maxDelay := os.Getenv("MAX_DELAY"); maxDelay != "" {
-		if delay, err := strconv.Atoi(maxDelay); err == nil {
-			config.Retry.MaxDelay = delay
+		delay, err := strconv.Atoi(maxDelay)
+		if err != nil {
+			return invalidEnv("MAX_DELAY", maxDelay, err)
 		}
+		config.Retry.MaxDelay = delay
 	}
+	return nil
 }
 
 // loadQueueConfig 加载队列配置
-func loadQueueConfig(config *Config) {
+func loadQueueConfig(config *Config) error {
 	if maxConcurrentTasks := os.Getenv("MAX_CONCURRENT_TASKS"); maxConcurrentTasks != "" {
-		if tasks, err := strconv.Atoi(maxConcurrentTasks); err == nil {
-			config.Queue.MaxConcurrentTasks = tasks
+		tasks, err := strconv.Atoi(maxConcurrentTasks)
+		if err != nil {
+			return invalidEnv("MAX_CONCURRENT_TASKS", maxConcurrentTasks, err)
 		}
+		config.Queue.MaxConcurrentTasks = tasks
 	}
 	if autoRetry := os.Getenv("AUTO_RETRY"); autoRetry != "" {
-		if n, err := strconv.Atoi(autoRetry); err == nil {
-			config.Queue.AutoRetry = &n
+		n, err := strconv.Atoi(autoRetry)
+		if err != nil {
+			return invalidEnv("AUTO_RETRY", autoRetry, err)
 		}
+		config.Queue.AutoRetry = &n
 	}
+	return nil
+}
+
+func invalidEnv(name, value string, err error) error {
+	return fmt.Errorf("环境变量 %s 的值 %q 无效: %w", name, value, err)
 }
 
 // loadStoreConfig 加载存储配置
@@ -405,6 +575,15 @@ func validateConfig(config *Config) error {
 	if config.API.ID == 0 || config.API.Hash == "" || config.API.Phone == "" {
 		return fmt.Errorf("缺少必要的API配置: API_ID, API_HASH, PHONE")
 	}
+	if !IsValidAPIID(int64(config.API.ID)) {
+		return fmt.Errorf("API_ID 必须是 1 到 %d 之间的整数", MaxTelegramAPIID)
+	}
+	if !IsValidAPIHash(config.API.Hash) {
+		return fmt.Errorf("API_HASH 必须为 32 位十六进制字符串")
+	}
+	if !IsValidPhone(config.API.Phone) {
+		return fmt.Errorf("PHONE 必须为国际格式（+ 后跟 7 到 15 位数字）")
+	}
 	return nil
 }
 
@@ -420,9 +599,33 @@ func (c *Config) SaveConfig(filename string) error {
 		return fmt.Errorf("序列化配置失败: %w", err)
 	}
 
-	if err := os.WriteFile(filename, data, FilePermission); err != nil {
+	dir := filepath.Dir(filename)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(filename)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("创建配置临时文件失败: %w", err)
+	}
+	tempName := temp.Name()
+	defer func() { _ = os.Remove(tempName) }()
+
+	// CreateTemp 默认已经是 0600；仍显式设置，保证未来实现变化时配置里的凭据不会扩大权限。
+	if err := temp.Chmod(FilePermission); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("设置配置文件权限失败: %w", err)
+	}
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
 		return fmt.Errorf("保存配置文件失败: %w", err)
 	}
-
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("同步配置文件失败: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("关闭配置文件失败: %w", err)
+	}
+	// 同目录 rename 保证读者只会看到旧文件或完整的新文件，写入中断不会留下半截 YAML。
+	if err := os.Rename(tempName, filename); err != nil {
+		return fmt.Errorf("替换配置文件失败: %w", err)
+	}
 	return nil
 }

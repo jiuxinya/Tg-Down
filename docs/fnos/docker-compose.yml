@@ -3,10 +3,11 @@
 # 然后浏览器打开 http://<NAS地址>:8080?token=<你的令牌> 完成 Telegram 网页登录。
 #
 # 必改项：
-#   1. TG_DOWN_WEB_TOKEN —— 访问令牌（必填，缺失容器将拒绝启动）
+#   1. TG_DOWN_WEB_TOKEN —— 至少 16 个字符的随机访问令牌（可用 openssl rand -hex 32 生成）
 #   2. 卷映射左侧路径 —— 按实际存储空间调整（fnOS 惯例为 /vol1/...，
 #      可在文件管理器中「复制原始路径」获取）
 #   3. API_ID / API_HASH —— 可选：也可留空，在网页端登录时填写
+#      网页填写的凭据会保存到 /data/config.yaml；请勿删除 /data 卷。
 services:
   tg-down:
     image: ghcr.io/heartcoolman/tg-down:latest
@@ -14,7 +15,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      TG_DOWN_WEB_TOKEN: "change-me"   # 必填：网页访问令牌
+      TG_DOWN_WEB_TOKEN: ""            # 必填：填入随机令牌，留空会拒绝启动
       API_ID: ""                        # 可选：https://my.telegram.org/apps
       API_HASH: ""                      # 可选
       PUID: "1000"                      # 文件属主，跑 `id` 查看你的 NAS 用户
@@ -24,6 +25,10 @@ services:
       # AUTO_RETRY: "2"                 # 任务失败自动重试次数
       # SAVE_METADATA: "false"          # 是否写 <文件>.json 元数据
       # NOTIFY_TELEGRAM_SELF: "false"   # 任务完成时向 Saved Messages 发通知
+      # TG_PROXY: "socks5://192.168.1.10:7890"
+      #   ↑ NAS 网络无法直连 Telegram 时必配（现象：一直卡在"正在连接 Telegram"）。
+      #     也支持 http://host:port 与 mtproto://secret@host:port；
+      #     通用 HTTPS_PROXY / ALL_PROXY 环境变量同样会被用于 Telegram 连接。
     volumes:
       - /vol1/1000/tg-down/downloads:/downloads
       - /vol1/1000/tg-down/sessions:/sessions

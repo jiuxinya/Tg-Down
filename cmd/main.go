@@ -35,6 +35,8 @@ const (
 	ExitCodeRunError = 1
 	// ExitCodeSessionError is the exit code for session errors.
 	ExitCodeSessionError = 1
+	// ExitCodeUsage is the exit code for unrecognized command-line arguments.
+	ExitCodeUsage = 2
 
 	// SignalBufferSize is the buffer size for signal channel.
 	SignalBufferSize = 2
@@ -74,12 +76,39 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 && (os.Args[1] == "--help" || os.Args[1] == "-h") {
+		printUsage(os.Stdout)
+		return
+	}
+
+	// 无法识别的参数一律拒绝，不再"当作没传参数"直接进入交互模式。
+	// 那个行为很危险：一个拼错的 flag（`--config`、`--help`）会静默地用真实凭据登录、
+	// 连上真实账号并开始下载，而用户以为自己只是打了个错字。
+	if len(os.Args) > 1 {
+		_, _ = fmt.Fprintf(os.Stderr, "无法识别的参数: %s\n\n", os.Args[1])
+		printUsage(os.Stderr)
+		os.Exit(ExitCodeUsage)
+	}
+
 	cfg, log := initializeApplication()
 	if err := runApp(cfg, log); err != nil {
 		log.Error("%v", err)
 		os.Exit(ExitCodeRunError)
 	}
 	log.Info("程序退出")
+}
+
+// printUsage 输出命令行用法
+func printUsage(w io.Writer) {
+	_, _ = fmt.Fprintf(w, `tg-down %s — Telegram 媒体下载器
+
+用法:
+  tg-down                    交互式 CLI（读取当前目录的 config.yaml）
+  tg-down --web [监听地址]   Web 管理台（默认 %s）
+  tg-down --clear-session    清除本地 TDLib 会话
+  tg-down --version, -v      输出版本
+  tg-down --help, -h         输出本帮助
+`, version, web.DefaultAddr)
 }
 
 // runApp 承载 CLI 主流程：以 defer 打开/清理资源，出错时返回错误交由 main 决定退出码，
@@ -94,11 +123,27 @@ func runApp(cfg *config.Config, log *logger.Logger) error {
 	ctx, cancel := setupSignalHandling(log)
 	defer cancel()
 
-	mode := selectMode(log)
+	mode, err := selectMode(os.Stdin, os.Stdout)
+	if err != nil {
+		return fmt.Errorf("选择操作模式失败: %w", err)
+	}
 
 	// TDLib 客户端始终带更新监听；是否触发实时下载由 targetChatID 控制
 	client := telegram.NewWithUpdates(cfg, log, 0)
-	client.SetRecordFunc(store.NewRecorder(st))
+	client.SetRecordFunc(store.NewRecorder(st, func(err error) {
+		log.Warn("持久化下载历史失败: %v", err)
+	}))
+	client.SetDuplicateLookupFunc(func(ctx context.Context, uniqueID string) (string, bool) {
+		rec, err := st.FindCompletedByUniqueID(ctx, uniqueID)
+		if err != nil {
+			log.Warn("查询内容去重记录失败: %v", err)
+			return "", false
+		}
+		if rec == nil {
+			return "", false
+		}
+		return rec.FilePath, true
+	})
 	defer client.Close() // Close 在未连接(td==nil)时为无操作，认证失败也可安全调用
 
 	log.Info("正在连接到Telegram...")
@@ -111,11 +156,12 @@ func runApp(cfg *config.Config, log *logger.Logger) error {
 	if err != nil {
 		return err
 	}
+	chatTitle := client.ChatTitle(ctx, targetChatID)
 	if mode == ModeMonitorNewMessages || mode == ModeDownloadAndMonitor {
-		client.SetMonitorTask(fmt.Sprintf("cli-monitor-%d", time.Now().UnixNano()), targetChatID)
+		client.SetMonitorTask(fmt.Sprintf("cli-monitor-%d", time.Now().UnixNano()), targetChatID, chatTitle)
 	}
 
-	if err := executeMode(ctx, cancel, client, log, mode, targetChatID); err != nil {
+	if err := executeMode(ctx, cancel, client, log, mode, targetChatID, chatTitle); err != nil {
 		return fmt.Errorf("运行失败: %w", err)
 	}
 	return nil
@@ -174,12 +220,20 @@ func initializeApplication() (*config.Config, *logger.Logger) {
 	return cfg, log
 }
 
-// setupSignalHandling 设置信号处理
+// setupSignalHandling 设置信号处理。
+//
+// 这里不用 signal.NotifyContext：它在首个信号取消 ctx 后，内部 goroutine 就退出了，
+// 但信号仍注册在它那条容量 1 的通道上——第二次 Ctrl+C 会被吞掉，进程反而杀不掉。
+// 而下面这个「二次信号强制退出」正是卡在 fmt.Scanln（无视 ctx）时唯一的逃生口。
+//
+// Windows 上这两个信号都真实投递：runtime 的 ctrlHandler 把 CTRL_C/CTRL_BREAK 映射为 SIGINT，
+// 把窗口关闭/注销/关机映射为 SIGTERM。os.Interrupt 即 syscall.SIGINT（含 windows 构建标签），
+// 用它只是为了名字可移植。
 func setupSignalHandling(log *logger.Logger) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	sigChan := make(chan os.Signal, SignalBufferSize)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		<-sigChan
@@ -217,14 +271,15 @@ func executeMode(
 	log *logger.Logger,
 	mode int,
 	targetChatID int64,
+	chatTitle string,
 ) error {
 	switch mode {
 	case ModeDownloadHistory:
-		return executeDownloadHistory(ctx, client, log, targetChatID)
+		return executeDownloadHistory(ctx, client, log, targetChatID, chatTitle)
 	case ModeMonitorNewMessages:
 		return executeMonitorNewMessages(ctx, cancel, log, targetChatID)
 	case ModeDownloadAndMonitor:
-		return executeDownloadAndMonitor(ctx, client, log, targetChatID)
+		return executeDownloadAndMonitor(ctx, client, log, targetChatID, chatTitle)
 	default:
 		return fmt.Errorf("未知的操作模式: %d", mode)
 	}
@@ -246,20 +301,31 @@ func logHistoryMediaCount(ctx context.Context, client *telegram.Client, log *log
 }
 
 // executeDownloadHistory 执行下载历史媒体模式
-func executeDownloadHistory(ctx context.Context, client *telegram.Client, log *logger.Logger, targetChatID int64) error {
+func executeDownloadHistory(
+	ctx context.Context, client *telegram.Client, log *logger.Logger, targetChatID int64, chatTitle string,
+) error {
 	log.Info("开始下载历史媒体文件...")
 	if err := logHistoryMediaCount(ctx, client, log, targetChatID); err != nil {
 		return nil
 	}
 	taskID := fmt.Sprintf("cli-history-%d", time.Now().UnixNano())
-	spec := &downloader.HistorySpec{ChatID: targetChatID, TaskID: taskID}
-	if err := client.DownloadHistoryMedia(ctx, spec); err != nil {
+	spec := &downloader.HistorySpec{ChatID: targetChatID, ChatTitle: chatTitle, TaskID: taskID}
+	result, err := client.DownloadHistoryMedia(ctx, spec)
+	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
 		return fmt.Errorf("下载历史媒体失败: %w", err)
 	}
+	reportFailedMedia(log, result)
 	return nil
+}
+
+// reportFailedMedia 在有文件下载失败时明确告知用户，而不是静默地宣告成功
+func reportFailedMedia(log *logger.Logger, result *downloader.HistoryResult) {
+	if result != nil && result.Failed > 0 {
+		log.Warn("有 %d 个文件下载失败，可重新运行以补下（已下载的文件会被跳过）", result.Failed)
+	}
 }
 
 // executeMonitorNewMessages 执行监控新消息模式
@@ -278,19 +344,23 @@ func executeMonitorNewMessages(
 }
 
 // executeDownloadAndMonitor 执行下载历史并监控新消息模式
-func executeDownloadAndMonitor(ctx context.Context, client *telegram.Client, log *logger.Logger, targetChatID int64) error {
+func executeDownloadAndMonitor(
+	ctx context.Context, client *telegram.Client, log *logger.Logger, targetChatID int64, chatTitle string,
+) error {
 	log.Info("开始下载历史媒体文件...")
 	if err := logHistoryMediaCount(ctx, client, log, targetChatID); err != nil {
 		return nil
 	}
 	taskID := fmt.Sprintf("cli-history-%d", time.Now().UnixNano())
-	spec := &downloader.HistorySpec{ChatID: targetChatID, TaskID: taskID}
-	if err := client.DownloadHistoryMedia(ctx, spec); err != nil {
+	spec := &downloader.HistorySpec{ChatID: targetChatID, ChatTitle: chatTitle, TaskID: taskID}
+	result, err := client.DownloadHistoryMedia(ctx, spec)
+	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
 		return fmt.Errorf("下载历史媒体失败: %w", err)
 	}
+	reportFailedMedia(log, result)
 	log.Info("历史媒体下载完成，实时监控已自动启动")
 	log.Info("实时监控已启动，目标聊天ID: %d", targetChatID)
 	<-ctx.Done()
@@ -403,46 +473,47 @@ func getUserChatChoice(maxChoice int) (int, error) {
 	return choice, nil
 }
 
-// selectMode 选择操作模式
-func selectMode(log *logger.Logger) int {
-	fmt.Println("\n请选择操作模式:")
-	fmt.Println("1. 只下载历史媒体文件")
-	fmt.Println("2. 只监控新消息")
-	fmt.Println("3. 下载历史媒体文件 + 监控新消息")
+// selectMode 选择操作模式。输入失败或非法时返回错误，不能替用户默认执行真实下载。
+func selectMode(input io.Reader, output io.Writer) (int, error) {
+	_, _ = fmt.Fprintln(output, "\n请选择操作模式:")
+	_, _ = fmt.Fprintln(output, "1. 只下载历史媒体文件")
+	_, _ = fmt.Fprintln(output, "2. 只监控新消息")
+	_, _ = fmt.Fprintln(output, "3. 下载历史媒体文件 + 监控新消息")
 
-	fmt.Print("\n请选择模式 (1-3): ")
+	_, _ = fmt.Fprint(output, "\n请选择模式 (1-3): ")
 	var choice string
-	if _, err := fmt.Scanln(&choice); err != nil {
-		log.Warn("读取输入失败，使用默认模式 %d", ModeDownloadAndMonitor)
-		return ModeDownloadAndMonitor
+	if _, err := fmt.Fscanln(input, &choice); err != nil {
+		return 0, fmt.Errorf("读取模式输入失败: %w", err)
 	}
 
 	mode, err := strconv.Atoi(choice)
 	if err != nil || mode < ModeDownloadHistory || mode > MaxModeChoice {
-		log.Warn("输入无效，使用默认模式 %d", ModeDownloadAndMonitor)
-		return ModeDownloadAndMonitor
+		return 0, fmt.Errorf("无效模式 %q，必须输入 1、2 或 3", choice)
 	}
 
-	return mode
+	return mode, nil
 }
 
 // clearSessionAndExit 清除会话并退出
 func clearSessionAndExit() {
 	fmt.Println("正在清除会话...")
-
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		fmt.Printf("加载配置失败: %v\n", err)
-		os.Exit(ExitCodeConfigError)
-	}
-
-	log := logger.New(config.DefaultLogLevel)
-	client := telegram.New(cfg, log)
-
-	if err := client.ClearSession(); err != nil {
+	if err := clearSession(); err != nil {
 		fmt.Printf("清除会话失败: %v\n", err)
 		os.Exit(ExitCodeSessionError)
 	}
 
 	fmt.Println("会话已清除，下次启动将需要重新登录")
+}
+
+// clearSession 只需要会话目录，不要求 API 凭据。凭据缺失或填写错误正是用户最常需要
+// 清理本地登录状态的场景，不能让严格的 CLI 配置校验挡在恢复入口之前。
+func clearSession() error {
+	sessionDir, err := config.LoadSessionDir()
+	if err != nil {
+		return fmt.Errorf("加载配置失败: %w", err)
+	}
+	if err := telegram.RemoveSessionDatabase(sessionDir); err != nil {
+		return fmt.Errorf("删除 TDLib 会话目录失败: %w", err)
+	}
+	return nil
 }

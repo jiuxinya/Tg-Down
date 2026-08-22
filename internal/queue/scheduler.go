@@ -13,6 +13,8 @@ const (
 	scheduleTickInterval = time.Minute
 	// MinScheduleIntervalMin 是定时计划允许的最小间隔（分钟），供 API 校验复用
 	MinScheduleIntervalMin = 10
+	// MaxScheduleIntervalMin 是 time.Duration 能安全表达的最大分钟数，供 API 校验复用。
+	MaxScheduleIntervalMin = int64((1<<63 - 1) / time.Minute)
 )
 
 // runScheduler 周期性巡检定时计划，到期的计划触发一次历史下载任务；
@@ -43,17 +45,44 @@ func (m *Manager) fireDueSchedules(ctx context.Context) {
 		if !r.Enabled {
 			continue
 		}
-		if r.LastRun != nil && now.Sub(*r.LastRun) < time.Duration(r.IntervalMin)*time.Minute {
+		intervalMin := int64(r.IntervalMin)
+		if intervalMin < MinScheduleIntervalMin || intervalMin > MaxScheduleIntervalMin {
+			m.logger.Warn("定时计划 %s 的间隔无效（%d 分钟），跳过触发", r.ID, r.IntervalMin)
 			continue
 		}
-		if err := m.store.TouchScheduleLastRun(ctx, r.ID, now); err != nil {
-			m.logger.Warn("更新定时计划触发时间失败: %v", err)
+		interval := time.Duration(intervalMin) * time.Minute
+		if r.LastRun != nil && now.Sub(*r.LastRun) < interval {
+			continue
+		}
+		m.mu.Lock()
+		accepting := m.acceptingLocked()
+		m.mu.Unlock()
+		if !accepting {
+			continue
 		}
 		var filters downloader.HistoryFilters
 		if r.Filters != "" {
-			_ = json.Unmarshal([]byte(r.Filters), &filters) // 解析失败退化为不过滤
+			if err := json.Unmarshal([]byte(r.Filters), &filters); err != nil {
+				m.logger.Warn("定时计划 %s 的过滤器 JSON 损坏，跳过触发: %v", r.ID, err)
+				continue
+			}
+			if problem := filters.Validate(); problem != "" {
+				m.logger.Warn("定时计划 %s 的过滤器无效，跳过触发: %s", r.ID, problem)
+				continue
+			}
 		}
-		spec := &downloader.HistorySpec{ChatID: r.ChatID, Filters: filters}
+		if err := m.store.TouchScheduleLastRun(ctx, r.ID, now); err != nil {
+			m.logger.Warn("更新定时计划触发时间失败: %v", err)
+			continue
+		}
+		// 增量扫描：只扫比上次水位更新的消息。首次触发（LastMaxID=0）仍为全量扫描。
+		spec := &downloader.HistorySpec{
+			ChatID:          r.ChatID,
+			ChatTitle:       r.ChatTitle,
+			Filters:         filters,
+			StopAtMessageID: r.LastMaxID,
+			ScheduleID:      r.ID,
+		}
 		if _, err := m.Enqueue(KindHistory, spec, r.ChatTitle); err != nil {
 			// 常见于同聊天已有排队/运行中的任务，跳过本次触发
 			m.logger.Info("定时计划 %s（聊天 %d）本次触发跳过: %v", r.ID, r.ChatID, err)

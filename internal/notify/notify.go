@@ -40,20 +40,28 @@ func New(selfSend func(ctx context.Context, text string) error, webhookURL strin
 
 // TaskFinished 异步发送任务终结通知（按任务粒度，绝不按文件）
 func (n *Notifier) TaskFinished(dto *queue.TaskDTO) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
-		defer cancel()
-		if n.selfSend != nil {
-			if err := n.selfSend(ctx, formatMessage(dto)); err != nil {
+	if dto == nil {
+		return
+	}
+	snapshot := *dto
+	if n.selfSend != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+			defer cancel()
+			if err := n.selfSend(ctx, formatMessage(&snapshot)); err != nil {
 				n.logger.Warn("Telegram 通知发送失败: %v", err)
 			}
-		}
-		if n.webhookURL != "" {
-			if err := n.postWebhook(ctx, dto); err != nil {
+		}()
+	}
+	if n.webhookURL != "" {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+			defer cancel()
+			if err := n.postWebhook(ctx, &snapshot); err != nil {
 				n.logger.Warn("webhook 通知发送失败: %v", err)
 			}
-		}
-	}()
+		}()
+	}
 }
 
 // formatMessage 生成 Saved Messages 通知文本
@@ -65,6 +73,11 @@ func formatMessage(dto *queue.TaskDTO) string {
 	switch dto.Status {
 	case string(queue.StatusCompleted):
 		return fmt.Sprintf("✅ Tg-Down 任务完成：%s\n下载 %d，跳过 %d，失败 %d",
+			title, dto.Stats.Downloaded, dto.Stats.Skipped, dto.Stats.Failed)
+	case string(queue.StatusPartial):
+		// partial 也是终态（历史扫完了，只是部分文件失败），queue 同样会触发通知。
+		// 落进 default 分支会把"下了 900 个、失败 100 个"报成彻底失败，还把成功数丢了。
+		return fmt.Sprintf("⚠️ Tg-Down 任务部分完成：%s\n下载 %d，跳过 %d，失败 %d",
 			title, dto.Stats.Downloaded, dto.Stats.Skipped, dto.Stats.Failed)
 	default:
 		return fmt.Sprintf("❌ Tg-Down 任务失败：%s\n%s", title, dto.Error)

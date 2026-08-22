@@ -21,6 +21,7 @@ JOBS="${JOBS:-4}"
 echo ">>> TDLib build: prefix=$PREFIX commit=${TDLIB_COMMIT:0:10} jobs=$JOBS"
 
 OPENSSL_ROOT=""
+CMAKE_GENERATOR_ARGS=()
 case "$(uname -s)" in
   Darwin)
     if command -v brew >/dev/null 2>&1; then
@@ -40,6 +41,30 @@ case "$(uname -s)" in
       $SUDO apt-get install -y make git zlib1g-dev libssl-dev gperf cmake g++
     fi
     ;;
+  MINGW* | MSYS*)
+    # Windows：必须走 MSYS2 + MinGW-w64。CGo 只认 gcc 系工具链，MSVC 这条路走不通。
+    if command -v pacman >/dev/null 2>&1; then
+      pacman -S --needed --noconfirm \
+        git make \
+        mingw-w64-x86_64-toolchain \
+        mingw-w64-x86_64-cmake \
+        mingw-w64-x86_64-gperf \
+        mingw-w64-x86_64-openssl \
+        mingw-w64-x86_64-zlib
+    else
+      echo "!!! 未找到 pacman：Windows 上请在 MSYS2 MINGW64 shell 里运行本脚本" >&2
+      exit 1
+    fi
+    # MSYS2 默认挑 "MSYS Makefiles" 生成器，产出的是 MSYS(POSIX 模拟) 二进制，
+    # CGo 的 mingw gcc 链不上；必须强制 MinGW 生成器。
+    CMAKE_GENERATOR_ARGS=(-G "MinGW Makefiles")
+    OPENSSL_ROOT="${MINGW_PREFIX:-/mingw64}"
+    ;;
+  *)
+    # 此前这里没有 default 分支：不认识的系统会静默跳过依赖安装，
+    # 然后在 cmake 阶段抛出一个与真正原因毫无关系的错误。
+    echo "!!! 未知系统 $(uname -s)：请自行安装 cmake / gperf / openssl / zlib / g++ 后重试" >&2
+    ;;
 esac
 
 mkdir -p "$SRC"
@@ -53,18 +78,27 @@ git checkout -f "$TDLIB_COMMIT"
 rm -rf build
 mkdir build
 cd build
-cmake -DCMAKE_BUILD_TYPE=Release \
+# ${arr[@]+"${arr[@]}"}：set -u 下空数组展开为零个词（而不是一个空字符串参数）
+cmake ${CMAKE_GENERATOR_ARGS[@]+"${CMAKE_GENERATOR_ARGS[@]}"} \
+  -DCMAKE_BUILD_TYPE=Release \
   ${OPENSSL_ROOT:+-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT"} \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" ..
 cmake --build . --target install -j"$JOBS"
 
 echo ">>> TDLib installed to $PREFIX"
 ls -la "$PREFIX/lib/"libtdjson* 2>/dev/null || true
+
+# PE 没有 rpath 的概念，MinGW 上带 -Wl,-rpath 只会让链接器报警
+RPATH_HINT=" -Wl,-rpath,$PREFIX/lib"
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) RPATH_HINT="" ;;
+esac
+
 cat <<EOF
 
 Done. Build the project with (statically linked against TDLib):
   export CGO_CFLAGS="-I$PREFIX/include${OPENSSL_ROOT:+ -I$OPENSSL_ROOT/include}"
-  export CGO_LDFLAGS="-L$PREFIX/lib -Wl,-rpath,$PREFIX/lib${OPENSSL_ROOT:+ -L$OPENSSL_ROOT/lib}"
+  export CGO_LDFLAGS="-L$PREFIX/lib${RPATH_HINT}${OPENSSL_ROOT:+ -L$OPENSSL_ROOT/lib}"
   go build ./...
 
 Or simply: make build   (the Makefile sets these automatically)

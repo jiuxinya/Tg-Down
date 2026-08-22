@@ -1,0 +1,137 @@
+import type {
+  Chat, DownloadSettings, ExportResult, HistoryFilters, HistoryPage, HistoryStatsResponse,
+  OKResponse, ResolvedTarget, Schedule, Settings, StateSnapshot, Task,
+} from './types'
+
+const TOKEN_KEY = 'tg_down_token'
+const COOKIE_AUTH_MARKER = 'tg_down_web_cookie_auth=1'
+
+function supportsCookieAuth(): boolean {
+  return document.cookie.split(';').some((part) => part.trim() === COOKIE_AUTH_MARKER)
+}
+
+type AuthInit = { token: string; redirecting: boolean }
+
+// 新版后端会在页面响应写入固定能力标记。检测到旧 localStorage 令牌时，立即删除原文，
+// 只导航一次让后端换成 HttpOnly Cookie。旧后端没有标记，才保留 Bearer/查询参数兼容。
+function initializeAuth(): AuthInit {
+  const fromURL = new URLSearchParams(location.search).get('token')
+  if (fromURL) {
+    // 新后端会在 HTML 发送前截获 token，因此 JS 能看到它说明当前仍是旧后端。
+    if (supportsCookieAuth()) {
+      try { localStorage.removeItem(TOKEN_KEY) } catch { /* 隐私模式下不可用，忽略 */ }
+      const clean = new URL(location.href)
+      clean.searchParams.delete('token')
+      history.replaceState(history.state, '', clean.pathname + clean.search + clean.hash)
+      return { token: '', redirecting: false }
+    }
+    try { localStorage.setItem(TOKEN_KEY, fromURL) } catch { /* 隐私模式下不可用，忽略 */ }
+    const clean = new URL(location.href)
+    clean.searchParams.delete('token')
+    history.replaceState(history.state, '', clean.pathname + clean.search + clean.hash)
+    return { token: fromURL, redirecting: false }
+  }
+
+  let stored = ''
+  try { stored = localStorage.getItem(TOKEN_KEY) || '' } catch { /* 隐私模式下不可用，忽略 */ }
+  if (stored && supportsCookieAuth()) {
+    try { localStorage.removeItem(TOKEN_KEY) } catch { /* 隐私模式下不可用，忽略 */ }
+    const target = new URL(location.href)
+    target.searchParams.set('token', stored)
+    location.replace(target.toString())
+    return { token: '', redirecting: true }
+  }
+  return { token: stored, redirecting: false }
+}
+
+const authInit = initializeAuth()
+export const authToken = authInit.token
+export const authRedirecting = authInit.redirecting
+
+export class APIError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+    this.name = 'APIError'
+  }
+}
+
+export function beginTokenBootstrap(token: string) {
+  try { localStorage.removeItem(TOKEN_KEY) } catch { /* 隐私模式下不可用，忽略 */ }
+  const target = new URL(location.href)
+  target.searchParams.set('token', token)
+  location.replace(target.toString())
+}
+
+// Cookie 引导是主路径；查询参数只在未发现能力标记的旧版部署中使用。
+// <img>/<video>/EventSource 无法自定义请求头，因此旧版只能继续走查询参数。
+export function withToken(path: string): string {
+  if (!authToken) return path
+  return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(authToken)
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (authToken) headers.set('Authorization', 'Bearer ' + authToken)
+  if (init?.body) headers.set('Content-Type', 'application/json')
+
+  const res = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  const text = await res.text()
+  let data: unknown = null
+  if (text) {
+    try { data = JSON.parse(text) } catch { data = null }
+  }
+  if (!res.ok) {
+    const msg = (data as { error?: string } | null)?.error
+    throw new APIError(msg || `HTTP ${res.status}`, res.status)
+  }
+  return data as T
+}
+
+const get = <T,>(path: string) => request<T>(path)
+const post = <T,>(path: string, body?: unknown) =>
+  request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
+
+export const api = {
+  state: () => get<StateSnapshot>('/api/state'),
+  chats: () => get<Chat[]>('/api/chats'),
+  refreshChats: () => post<Chat[]>('/api/chats/refresh'),
+  settings: () => get<Settings>('/api/settings'),
+  setClassify: (v: boolean) => post<Settings>('/api/settings/classify', { classify_by_type: v }),
+
+  submitCredentials: (api_id: number, api_hash: string, phone: string) =>
+    post<OKResponse>('/api/auth/credentials', { api_id, api_hash, phone }),
+  submitCode: (code: string) => post<OKResponse>('/api/auth/code', { code }),
+  submitPassword: (password: string) => post<OKResponse>('/api/auth/password', { password }),
+  abortAuth: () => post<OKResponse>('/api/auth/abort'),
+  logout: () => post<OKResponse>('/api/auth/logout'),
+
+  tasks: () => get<Task[]>('/api/tasks'),
+  createTask: (body: { kind: string; chat_id: number; chat_title?: string; filters?: HistoryFilters; message_id?: number }) =>
+    post<Task>('/api/tasks', body),
+  cancelTask: (id: string) => post<OKResponse>(`/api/tasks/${id}/cancel`),
+  retryTask: (id: string) => post<Task>(`/api/tasks/${id}/retry`),
+  resolve: (input: string) => post<ResolvedTarget>('/api/resolve', { input }),
+
+  setConcurrency: (n: number) => post<DownloadSettings>('/api/download/concurrency', { max_concurrent: n }),
+  pauseMedia: (id: string) => post<OKResponse>(`/api/media/${encodeURIComponent(id)}/pause`),
+  resumeMedia: (id: string) => post<OKResponse>(`/api/media/${encodeURIComponent(id)}/resume`),
+  pauseAll: () => post<OKResponse>('/api/media/pause-all'),
+  resumeAll: () => post<OKResponse>('/api/media/resume-all'),
+
+  history: (params: URLSearchParams) => get<HistoryPage>('/api/history?' + params.toString()),
+  historyStats: (params: URLSearchParams) => get<HistoryStatsResponse>('/api/history/stats?' + params.toString()),
+
+  schedules: () => get<Schedule[]>('/api/schedules'),
+  createSchedule: (body: { chat_id: number; chat_title?: string; interval_min: number; filters?: HistoryFilters }) =>
+    post<Schedule>('/api/schedules', body),
+  deleteSchedule: (id: string) => request<OKResponse>(`/api/schedules/${id}`, { method: 'DELETE' }),
+  toggleSchedule: (id: string, enabled: boolean) =>
+    post<OKResponse>(`/api/schedules/${id}/toggle`, { enabled }),
+
+  exportChat: (chat_id: number, chat_title: string, limit: number) =>
+    post<ExportResult>('/api/export', { chat_id, chat_title, limit }),
+}
+
+// 媒体 URL：按 history id 寻址，后端据此查库拿路径（见 internal/web/media.go）
+export const thumbURL = (id: number) => withToken(`/api/history/${id}/thumb`)
+export const fileURL = (id: number) => withToken(`/api/history/${id}/file`)

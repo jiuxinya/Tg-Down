@@ -5,10 +5,10 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 env:
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.25.12'
 
 jobs:
   # CGo + TDLib 无法交叉编译，故按平台原生构建（仅 linux-amd64 与 darwin-arm64）。
@@ -46,6 +46,16 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        run: cd web && npm ci --no-audit --no-fund && npm run build
+
       - name: Setup TDLib
         uses: ./.github/actions/setup-tdlib
 
@@ -57,7 +67,7 @@ jobs:
         run: |
           mkdir -p dist/pkg/lib
           # 覆盖 setup-tdlib 导出的 rpath：发布包在用户机器上从 $ORIGIN/lib 找动态依赖
-          export CGO_LDFLAGS="-L$HOME/.tdlib/lib -Wl,-rpath,\$ORIGIN/lib -ltdjson_static -ltdjson_private -ltdclient -ltdcore -ltde2e -ltdmtproto -ltdactor -ltdapi -ltddb -ltdsqlite -ltdnet -ltdutils -lstdc++ -lssl -lcrypto -ldl -lz -lm"
+          export CGO_LDFLAGS="-L$HOME/.tdlib/lib -Wl,-rpath,\$ORIGIN/lib $(bash scripts/tdlib-libs.sh --print)"
           # -buildvcs=false：容器内 git 目录属主不匹配会使 VCS stamping 失败，版本号已由 ldflags 注入
           go build -buildvcs=false -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o dist/pkg/tg-down ./cmd
           # 捆绑 OpenSSL 1.1：debian:11 之后的发行版已不再提供该版本
@@ -72,7 +82,7 @@ jobs:
 
       - name: Assemble package
         run: |
-          cp config.yaml.example dist/pkg/config.yaml
+          install -m 600 config.yaml.example dist/pkg/config.yaml
           cp .env.example dist/pkg/.env.example || true
           cp LICENSE dist/pkg/ || true
           cp README.md dist/pkg/ || true
@@ -93,10 +103,114 @@ jobs:
           name: tg-down-${{ matrix.name }}
           path: tg-down-${{ matrix.name }}.tar.gz
 
+  # Windows 单列一个作业：它整条链路都在 MSYS2 shell 里，塞进上面的 matrix 会把
+  # 容器/apt 那几步的 shell 语义搅乱。产物是 .zip + .bat（tar.gz + start.sh 在 Windows 上没意义）。
+  build-windows:
+    name: Build windows-amd64
+    runs-on: windows-latest
+    env:
+      TDLIB_PREFIX: C:/tdlib
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up MSYS2 (MinGW-w64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: false
+          install: git make
+          pacboy: >-
+            toolchain:p
+            cmake:p
+            gperf:p
+            openssl:p
+            zlib:p
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        shell: pwsh
+        run: cd web; npm ci --no-audit --no-fund; npm run build
+
+      - name: Cache TDLib
+        id: tdlib-cache
+        uses: actions/cache@v4
+        with:
+          path: C:/tdlib
+          key: tdlib-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-tdlib.sh') }}
+
+      - name: Build TDLib (cache miss)
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        run: bash scripts/install-tdlib.sh
+
+      - name: Export CGO env
+        run: |
+          {
+            echo "CGO_ENABLED=1"
+            echo "CGO_CFLAGS=-I$TDLIB_PREFIX/include"
+            echo "CGO_LDFLAGS=-L$TDLIB_PREFIX/lib $(bash scripts/tdlib-libs.sh --print)"
+          } >> "$GITHUB_ENV"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: |
+          mkdir -p dist/pkg
+          LDFLAGS="-s -w -X main.version=${GITHUB_REF_NAME}"
+          # 优先全静态：MinGW 默认链 libssl.dll.a/libstdc++-6.dll，动态产物离开 MSYS2 就跑不起来。
+          # 静态链接一旦失败也不让发布挂掉——退回动态，再把残留的 mingw64 DLL 捆进包里。
+          if ! go build -buildvcs=false -ldflags "$LDFLAGS -extldflags '-static'" -o dist/pkg/tg-down.exe ./cmd; then
+            echo ">>> 静态链接失败，回退动态链接 + 捆绑 DLL"
+            go build -buildvcs=false -ldflags "$LDFLAGS" -o dist/pkg/tg-down.exe ./cmd
+          fi
+          # 静态成功时这里一个文件都不会拷
+          ldd dist/pkg/tg-down.exe | awk '/mingw64/ {print $3}' | while read -r dll; do
+            cp -n "$dll" dist/pkg/
+          done
+          echo ">>> 剩余动态依赖："
+          ldd dist/pkg/tg-down.exe
+
+      - name: Assemble package
+        run: |
+          cp config.yaml.example dist/pkg/config.yaml
+          cp .env.example dist/pkg/.env.example || true
+          cp LICENSE dist/pkg/ || true
+          cp README.md dist/pkg/ || true
+          # cmd.exe 要 CRLF，printf 显式写死，别指望 heredoc 的行尾
+          printf '@echo off\r\ncd /d "%%~dp0"\r\nif not exist downloads mkdir downloads\r\nif not exist sessions mkdir sessions\r\ntg-down.exe %%*\r\n' > dist/pkg/start.bat
+
+      - name: Zip package
+        shell: pwsh
+        run: Compress-Archive -Path dist/pkg/* -DestinationPath tg-down-windows-amd64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: tg-down-windows-amd64
+          path: tg-down-windows-amd64.zip
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v5
@@ -107,7 +221,8 @@ jobs:
       - name: Checksums
         run: |
           cd artifacts
-          sha256sum tg-down-*.tar.gz > checksums.txt
+          # 别写死 .tar.gz：Windows 发布包是 .zip
+          sha256sum tg-down-* > checksums.txt
           cat checksums.txt
 
       - name: Create Release
@@ -115,6 +230,7 @@ jobs:
         with:
           files: |
             artifacts/tg-down-*.tar.gz
+            artifacts/tg-down-*.zip
             artifacts/checksums.txt
           generate_release_notes: true
           draft: false
@@ -126,19 +242,22 @@ jobs:
             - **Linux x86_64**: `tg-down-linux-amd64.tar.gz`——在 debian:11 构建（glibc ≥ 2.31 即可运行，
               覆盖 Debian 11+/Ubuntu 20.04+），OpenSSL 1.1 已随包捆绑于 `lib/`，开箱即用
             - **macOS Apple Silicon**: `tg-down-darwin-arm64.tar.gz`——需 `brew install openssl@3`
+            - **Windows x86_64**: `tg-down-windows-amd64.zip`——MinGW-w64 构建，解压即用
             - **Docker（推荐，含 arm64）**: `docker pull ghcr.io/heartcoolman/tg-down:latest`，
               飞牛 fnOS 等 NAS 部署见 README「飞牛OS (fnOS) 部署」
 
-            > TDLib 已静态链入二进制。Windows 及交叉编译目标因 CGo 暂不提供，
+            > TDLib 已静态链入二进制。其余平台/架构因 CGo 无法交叉编译，
             > 可在对应平台自行 `make tdlib && make build` 构建。
 
             ### 🚀 使用
             1. 解压，编辑 `config.yaml` 填入 Telegram API 信息（https://my.telegram.org/apps）
-            2. 运行 `./start.sh`（或 `./tg-down`；`./tg-down --web` 启动网页管理端）
+            2. 运行 `./start.sh`（Windows：双击 `start.bat`）；`./tg-down --web` 启动网页管理端
 
   dependency-submission:
     runs-on: ubuntu-latest
     name: Submit Dependencies for Release
+    permissions:
+      contents: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v6

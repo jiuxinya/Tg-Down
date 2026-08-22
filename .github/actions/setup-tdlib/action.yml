@@ -23,7 +23,7 @@ runs:
       # go-tdlib master 起 darwin 无内置链接指令、linux 内置静态列表缺 tde2e，
       # 统一在此补全 TDLib 静态库；macOS 另需 Homebrew OpenSSL 路径。
       run: |
-        TDLIB_STATIC_LIBS="-ltdjson_static -ltdjson_private -ltdclient -ltdcore -ltde2e -ltdmtproto -ltdactor -ltdapi -ltddb -ltdsqlite -ltdnet -ltdutils -lstdc++ -lssl -lcrypto -ldl -lz -lm"
+        TDLIB_STATIC_LIBS="$(bash scripts/tdlib-libs.sh --print)"
         CFLAGS="-I$HOME/.tdlib/include"
         LDFLAGS="-L$HOME/.tdlib/lib -Wl,-rpath,$HOME/.tdlib/lib"
         if [ "$(uname -s)" = "Darwin" ]; then

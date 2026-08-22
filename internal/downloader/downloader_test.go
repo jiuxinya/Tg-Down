@@ -98,25 +98,6 @@ func TestDownloader_PauseWhileQueued(t *testing.T) {
 	}
 }
 
-// TestClassifyDir 校验媒体类型到分类子目录的映射
-func TestClassifyDir(t *testing.T) {
-	cases := map[string]string{
-		"photo":     "photo",
-		"document":  "document",
-		"video":     "video",
-		"animation": "animation",
-		"audio":     "audio",
-		"voice":     "voice",
-		"sticker":   "other",
-		"":          "other",
-	}
-	for mediaType, want := range cases {
-		if got := classifyDir(mediaType); got != want {
-			t.Errorf("classifyDir(%q) = %q, want %q", mediaType, got, want)
-		}
-	}
-}
-
 // TestDownloadMedia_ClassifyByType 校验开启/关闭分类时的目录结构
 func TestDownloadMedia_ClassifyByType(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
@@ -164,7 +145,7 @@ func TestDownloadMedia_ClassifyByType(t *testing.T) {
 			return os.WriteFile(filePath, []byte("data"), 0600)
 		})
 
-		media := &MediaInfo{MessageID: 1, ChatID: 100, MediaType: "sticker", FileName: "a.webp"}
+		media := &MediaInfo{MessageID: 1, ChatID: 100, MediaType: "webp", FileName: "a.webp"}
 		if err := d.DownloadMedia(context.Background(), media); err != nil {
 			t.Fatalf("DownloadMedia() error = %v", err)
 		}
@@ -185,8 +166,8 @@ func TestDownloadMedia_RecordFunc(t *testing.T) {
 			return os.WriteFile(filePath, []byte("data"), 0600)
 		})
 
-		var events []RecordEvent
-		d.SetRecordFunc(func(_ context.Context, evt RecordEvent) {
+		var events []*RecordEvent
+		d.SetRecordFunc(func(_ context.Context, evt *RecordEvent) {
 			events = append(events, evt)
 		})
 
@@ -195,7 +176,7 @@ func TestDownloadMedia_RecordFunc(t *testing.T) {
 			t.Fatalf("DownloadMedia() error = %v", err)
 		}
 
-		wantStatuses := []RecordStatus{RecordStarted, RecordCompleted}
+		wantStatuses := []RecordStatus{RecordQueued, RecordCompleted}
 		assertStatuses(t, events, wantStatuses)
 	})
 
@@ -207,8 +188,8 @@ func TestDownloadMedia_RecordFunc(t *testing.T) {
 			return wantErr
 		})
 
-		var events []RecordEvent
-		d.SetRecordFunc(func(_ context.Context, evt RecordEvent) {
+		var events []*RecordEvent
+		d.SetRecordFunc(func(_ context.Context, evt *RecordEvent) {
 			events = append(events, evt)
 		})
 
@@ -217,7 +198,7 @@ func TestDownloadMedia_RecordFunc(t *testing.T) {
 			t.Fatal("DownloadMedia() expected error, got nil")
 		}
 
-		wantStatuses := []RecordStatus{RecordStarted, RecordFailed}
+		wantStatuses := []RecordStatus{RecordQueued, RecordFailed}
 		assertStatuses(t, events, wantStatuses)
 		if events[1].Reason != wantErr.Error() {
 			t.Errorf("RecordFailed.Reason = %q, want %q", events[1].Reason, wantErr.Error())
@@ -240,22 +221,87 @@ func TestDownloadMedia_RecordFunc(t *testing.T) {
 			t.Fatalf("WriteFile() error = %v", err)
 		}
 
-		var events []RecordEvent
-		d.SetRecordFunc(func(_ context.Context, evt RecordEvent) {
+		var events []*RecordEvent
+		d.SetRecordFunc(func(_ context.Context, evt *RecordEvent) {
 			events = append(events, evt)
 		})
 
-		media := &MediaInfo{MessageID: 1, ChatID: 100, MediaType: "photo", FileName: "c.jpg"}
+		// 已存在文件的大小与 FileSize 一致（8 字节），应跳过
+		media := &MediaInfo{MessageID: 1, ChatID: 100, MediaType: "photo", FileName: "c.jpg", FileSize: 8}
 		if err := d.DownloadMedia(context.Background(), media); err != nil {
 			t.Fatalf("DownloadMedia() error = %v", err)
 		}
 
-		wantStatuses := []RecordStatus{RecordSkipped}
+		// 每个媒体恰好一次 RecordQueued + 一次终态事件，跳过也不例外
+		wantStatuses := []RecordStatus{RecordQueued, RecordSkipped}
 		assertStatuses(t, events, wantStatuses)
+	})
+
+	// 残留的半截文件（大小与期望不符）不得被永久跳过：此前只要 os.Stat 命中就跳过，
+	// 一个 0 字节的残留文件会让用户永远拿不到这个媒体。
+	t.Run("existing_wrong_size_redownloads", func(t *testing.T) {
+		dir := t.TempDir()
+		d := newTestDownloader(dir)
+
+		var downloaded bool
+		d.SetDownloadFunc(func(_ context.Context, _ *MediaInfo, filePath string) error {
+			downloaded = true
+			return os.WriteFile(filePath, []byte("full-content"), 0600)
+		})
+
+		chatDir := filepath.Join(dir, "chat_100")
+		if err := os.MkdirAll(chatDir, DirectoryPermission); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		// 残留的 0 字节文件
+		if err := os.WriteFile(filepath.Join(chatDir, "d.jpg"), nil, 0600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+
+		var events []*RecordEvent
+		d.SetRecordFunc(func(_ context.Context, evt *RecordEvent) {
+			events = append(events, evt)
+		})
+
+		media := &MediaInfo{MessageID: 1, ChatID: 100, MediaType: "photo", FileName: "d.jpg", FileSize: 12}
+		if err := d.DownloadMedia(context.Background(), media); err != nil {
+			t.Fatalf("DownloadMedia() error = %v", err)
+		}
+
+		if !downloaded {
+			t.Fatal("大小不符的残留文件应被重新下载，而不是跳过")
+		}
+		assertStatuses(t, events, []RecordStatus{RecordQueued, RecordCompleted})
+	})
+
+	t.Run("zero_byte_existing_file_redownloads_when_size_unknown", func(t *testing.T) {
+		dir := t.TempDir()
+		d := newTestDownloader(dir)
+		chatDir := filepath.Join(dir, "chat_100")
+		if err := os.MkdirAll(chatDir, DirectoryPermission); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(chatDir, "unknown.jpg")
+		if err := os.WriteFile(target, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		d.SetDownloadFunc(func(_ context.Context, _ *MediaInfo, filePath string) error {
+			called = true
+			return os.WriteFile(filePath, []byte("downloaded"), 0o600)
+		})
+
+		media := &MediaInfo{MessageID: 2, ChatID: 100, MediaType: "photo", FileName: "unknown.jpg"}
+		if err := d.DownloadMedia(context.Background(), media); err != nil {
+			t.Fatalf("DownloadMedia() error = %v", err)
+		}
+		if !called {
+			t.Fatal("大小未知的 0 字节文件被错误跳过")
+		}
 	})
 }
 
-func assertStatuses(t *testing.T, events []RecordEvent, want []RecordStatus) {
+func assertStatuses(t *testing.T, events []*RecordEvent, want []RecordStatus) {
 	t.Helper()
 	if len(events) != len(want) {
 		t.Fatalf("got %d events, want %d (events=%+v)", len(events), len(want), events)
@@ -576,8 +622,8 @@ func TestDownloadMedia_DuplicateLookup(t *testing.T) {
 		downloads++
 		return os.WriteFile(filePath, []byte("fresh"), 0o600)
 	})
-	var events []RecordEvent
-	d.SetRecordFunc(func(_ context.Context, evt RecordEvent) { events = append(events, evt) })
+	var events []*RecordEvent
+	d.SetRecordFunc(func(_ context.Context, evt *RecordEvent) { events = append(events, evt) })
 	d.SetDuplicateLookupFunc(func(_ context.Context, uniqueID string) (string, bool) {
 		if uniqueID == "dup-1" {
 			return src, true
@@ -589,7 +635,7 @@ func TestDownloadMedia_DuplicateLookup(t *testing.T) {
 	})
 
 	// 命中且源文件存在：复制、skipped、不触发下载
-	m1 := &MediaInfo{MessageID: 1, TDFileID: 1, UniqueID: "dup-1", MediaType: "document", FileName: "copy.bin", ChatID: 100}
+	m1 := &MediaInfo{MessageID: 1, TDFileID: 1, UniqueID: "dup-1", MediaType: "document", FileName: "copy.bin", FileSize: 7, ChatID: 100}
 	if err := d.DownloadMedia(context.Background(), m1); err != nil {
 		t.Fatalf("DownloadMedia(dup) error = %v", err)
 	}
@@ -612,5 +658,113 @@ func TestDownloadMedia_DuplicateLookup(t *testing.T) {
 	}
 	if downloads != 1 {
 		t.Fatalf("源文件缺失应回退下载, downloads = %d", downloads)
+	}
+
+	// 期望大小未知时无法证明本地源文件完整，必须回退真实下载。
+	m3 := &MediaInfo{MessageID: 3, TDFileID: 3, UniqueID: "dup-1", MediaType: "document", FileName: "unknown.bin", ChatID: 100}
+	if err := d.DownloadMedia(context.Background(), m3); err != nil {
+		t.Fatalf("DownloadMedia(unknown size) error = %v", err)
+	}
+	if downloads != 2 {
+		t.Fatalf("未知大小的去重源应回退下载, downloads = %d", downloads)
+	}
+
+	// 已知大小与源文件不符同样不能复制。
+	m4 := &MediaInfo{MessageID: 4, TDFileID: 4, UniqueID: "dup-1", MediaType: "document", FileName: "corrupt.bin", FileSize: 8, ChatID: 100}
+	if err := d.DownloadMedia(context.Background(), m4); err != nil {
+		t.Fatalf("DownloadMedia(corrupt source) error = %v", err)
+	}
+	if downloads != 3 {
+		t.Fatalf("大小不符的去重源应回退下载, downloads = %d", downloads)
+	}
+}
+
+func TestDownloadMedia_RejectsSymlinksInTargetPath(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		linkTarget bool
+	}{
+		{name: "directory symlink"},
+		{name: "target file symlink", linkTarget: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			outside := t.TempDir()
+			outsideFile := filepath.Join(outside, "outside.jpg")
+			if err := os.WriteFile(outsideFile, []byte("unchanged"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			chatDir := filepath.Join(root, "chat_100")
+			if tc.linkTarget {
+				if err := os.MkdirAll(chatDir, DirectoryPermission); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outsideFile, filepath.Join(chatDir, "photo.jpg")); err != nil {
+					t.Skipf("无法创建符号链接: %v", err)
+				}
+			} else if err := os.Symlink(outside, chatDir); err != nil {
+				t.Skipf("无法创建符号链接: %v", err)
+			}
+
+			d := newTestDownloader(root)
+			called := false
+			d.SetDownloadFunc(func(_ context.Context, _ *MediaInfo, _ string) error {
+				called = true
+				return nil
+			})
+			media := &MediaInfo{MessageID: 1, ChatID: 100, MediaType: "photo", FileName: "photo.jpg", FileSize: 4}
+			if err := d.DownloadMedia(context.Background(), media); err == nil {
+				t.Fatal("符号链接路径应被拒绝")
+			}
+			if called {
+				t.Fatal("路径校验失败后不应调用下载函数")
+			}
+			got, err := os.ReadFile(outsideFile)
+			if err != nil || string(got) != "unchanged" {
+				t.Fatalf("外部文件被修改: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestMetadataSidecarIsPrivateAndDoesNotFollowSymlink(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	chatDir := filepath.Join(root, "chat_100")
+	if err := os.MkdirAll(chatDir, DirectoryPermission); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := filepath.Join(chatDir, "photo.jpg.json")
+	if err := os.Symlink(outside, sidecar); err != nil {
+		t.Skipf("无法创建符号链接: %v", err)
+	}
+
+	d := newTestDownloader(root)
+	d.SetSaveMetadata(true)
+	d.SetDownloadFunc(func(_ context.Context, _ *MediaInfo, path string) error {
+		return os.WriteFile(path, []byte("data"), 0o600)
+	})
+	media := &MediaInfo{MessageID: 1, ChatID: 100, MediaType: "photo", FileName: "photo.jpg", FileSize: 4}
+	if err := d.DownloadMedia(context.Background(), media); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(outside)
+	if err != nil || string(got) != "unchanged" {
+		t.Fatalf("sidecar 写入跟随了符号链接: %q, %v", got, err)
+	}
+	info, err := os.Lstat(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("sidecar 仍是符号链接")
+	}
+	if info.Mode().Perm() != metadataFilePerm {
+		t.Errorf("sidecar 权限 = %o, want %o", info.Mode().Perm(), metadataFilePerm)
 	}
 }

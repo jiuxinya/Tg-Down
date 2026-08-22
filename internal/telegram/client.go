@@ -13,14 +13,18 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	tdclient "github.com/zelenin/go-tdlib/client"
+	"golang.org/x/term"
 
 	"tg-down/internal/config"
 	"tg-down/internal/downloader"
 	"tg-down/internal/logger"
+	mediapkg "tg-down/internal/media"
 	"tg-down/internal/retry"
+	"tg-down/internal/tgapi"
 )
 
 const (
@@ -37,8 +41,14 @@ const (
 	// RenameSleepDuration is the sleep duration between move retries.
 	RenameSleepDuration = 500 * time.Millisecond
 
-	// downloadPriority is the TDLib download priority (1-32).
+	// downloadPriority is the TDLib download priority (1-32; 数字越大越优先)。
 	downloadPriority = 1
+	// thumbDownloadPriority 与主文件同为最低档：TDLib 的优先级下界就是 1，
+	// 没法把缩略图排得更靠后。它们本身只有几十 KB，抢不走多少带宽。
+	thumbDownloadPriority = 1
+	// thumbDownloadTimeout 是单个缩略图的下载超时。缩略图很小，
+	// 拖久了直接放弃（画廊会退回 minithumb 占位图），不值得为它拖住整个下载。
+	thumbDownloadTimeout = 30 * time.Second
 	// chatLoadBatch is the per-call chat-loading batch size.
 	chatLoadBatch = 100
 	// maxChatLimit is the upper bound passed to getChats (returns all cached chats).
@@ -51,26 +61,9 @@ const (
 	fallbackTimeout = 24 * time.Hour
 	// metadataTimeout bounds metadata calls (chats/history) so a stuck request fails fast.
 	metadataTimeout = 2 * time.Minute
-	// emptyHistoryRetries is how many consecutive empty pages end a history sweep.
-	// TDLib often returns empty pages while it fetches history from the server
-	// (even with OnlyLocal:false), so the budget must tolerate that latency.
-	emptyHistoryRetries = 8
-	// emptyHistorySleep is the base wait between consecutive empty history pages;
-	// the actual wait grows with the empty streak (capped) so slow server-side
-	// backfill is not mistaken for end-of-history.
-	emptyHistorySleep = 1 * time.Second
-	// maxEmptyHistorySleep caps the progressive empty-page backoff.
-	maxEmptyHistorySleep = 5 * time.Second
 	// scanLogInterval spaces out history-scan progress log lines so long
 	// media-sparse stretches still show visible activity without log spam.
 	scanLogInterval = 15 * time.Second
-
-	mediaTypePhoto     = "photo"
-	mediaTypeDocument  = "document"
-	mediaTypeVideo     = "video"
-	mediaTypeAnimation = "animation"
-	mediaTypeAudio     = "audio"
-	mediaTypeVoice     = "voice"
 
 	copyBufferSize = 1 << 20 // 1MB copy buffer for cross-device fallback
 
@@ -80,7 +73,37 @@ const (
 	tdNotFoundCode = 404
 	// logoutCloseTimeout 是 LogOut 后等待 TDLib 销毁本地数据并进入 closed 状态的上限
 	logoutCloseTimeout = 10 * time.Second
+	// tdCloseTimeout 限制普通 Close 等待 TDLib 响应的时间。
+	tdCloseTimeout = 10 * time.Second
+
+	// maxFloodWait 是可接受的最长限流等待。Telegram 的 FLOOD_WAIT 通常是秒到分钟级；
+	// 超过此值说明限流窗口过长，与其占着下载槽空等，不如失败后由任务级重试接手。
+	maxFloodWait = 5 * time.Minute
+
+	// minDownloadTimeout 是单文件下载的最小时限（小文件也允许慢速链路下的握手与排队）。
+	minDownloadTimeout = 30 * time.Minute
+	// downloadMinBytesPerSec 是推算下载时限所假设的最低吞吐（约 20 KB/s）。低于此速度视为卡死。
+	downloadMinBytesPerSec = 20 * 1024
 )
+
+// downloadTimeout 按文件大小推算单次下载的时限。
+//
+// 此前所有 TDLib 请求统一用 24 小时的 fallbackTimeout，于是一个卡死的下载会把 goroutine
+// 挂住整整一天（tdCall 的后台 goroutine 脱离请求 ctx，取消不会中止底层请求）。按大小推算
+// 的时限让卡死的下载有界退出，同时不会误杀慢速链路上的大文件。
+func downloadTimeout(size int64) time.Duration {
+	if size <= 0 {
+		return fallbackTimeout // 大小未知：保持宽松上限，交由 TDLib 自行收敛
+	}
+	d := time.Duration(size/downloadMinBytesPerSec) * time.Second
+	if d < minDownloadTimeout {
+		return minDownloadTimeout
+	}
+	if d > fallbackTimeout {
+		return fallbackTimeout
+	}
+	return d
+}
 
 // appVersion 上报给 TDLib 的设备/应用版本，由 SetAppVersion 在启动时注入构建版本
 var appVersion = "dev"
@@ -92,18 +115,26 @@ func SetAppVersion(v string) {
 	}
 }
 
-// CodeFunc 提供登录验证码
-type CodeFunc func(ctx context.Context) (string, error)
+// 以下类型的定义在 internal/tgapi（无 CGo 的叶子包），这里别名再导出：
+// web 层只依赖 tgapi，就不会被本包的 TDLib/CGo 依赖传染，其测试无需先编 TDLib。
+type (
+	// CodeFunc 提供登录验证码
+	CodeFunc = tgapi.CodeFunc
+	// PasswordFunc 提供两步验证密码
+	PasswordFunc = tgapi.PasswordFunc
+	// ChatInfo 聊天信息
+	ChatInfo = tgapi.ChatInfo
+	// ResolvedTarget 是一次目标解析的结果
+	ResolvedTarget = tgapi.ResolvedTarget
+	// ExportSpec 描述一次聊天导出
+	ExportSpec = tgapi.ExportSpec
+	// ExportResult 是导出产物的落盘位置与规模
+	ExportResult = tgapi.ExportResult
+)
 
-// PasswordFunc 提供两步验证密码
-type PasswordFunc func(ctx context.Context) (string, error)
-
-// ChatInfo 聊天信息
-type ChatInfo struct {
-	ID    int64  `json:"id"`
-	Title string `json:"title"`
-	Type  string `json:"type"`
-}
+// 钉住 *Client 满足 web 层依赖的接口：改动方法签名时在本包就会编译失败，
+// 而不是等到 web 包才暴露。
+var _ tgapi.Client = (*Client)(nil)
 
 // Client 是基于 TDLib 的 Telegram 客户端包装器
 type Client struct {
@@ -115,19 +146,42 @@ type Client struct {
 	dbDir    string // TDLib 数据库/会话目录
 	filesDir string // TDLib 文件缓存目录（与下载目录同盘，便于 rename）
 
-	targetChatID  atomic.Int64 // 实时监控目标（0 = 不监控）
-	monitorTaskID atomic.Value // 实时监控关联的任务ID（string，""=无关联任务）
+	monitorSwitchMu sync.Mutex // 串行化“停止旧监控并安装新监控”的完整过程
+	monitorMu       sync.RWMutex
+	monitor         *monitorGeneration // 当前一代监控；锁内整体替换，切换期间没有空状态
+	connState       atomic.Value       // TDLib 网络连接状态（string），供 Web 端显示"等待网络"等
 
 	mu       sync.Mutex
-	td       *tdclient.Client // Connect 后才有值
-	closedCh chan struct{}    // Logout 前注册，TDLib 发布 authorizationStateClosed 时关闭
+	td       tdAPI         // Connect 后才有值；接口类型使本包可在无真实 TDLib 连接时测试
+	closedCh chan struct{} // Logout 前注册，TDLib 发布 authorizationStateClosed 时关闭
 
 	credMu sync.Mutex // 保护 config.API 凭据（Web 端可动态注入）
 
 	trackMu   sync.Mutex
 	fileTrack map[int32]*fileProgress // TDLib file id -> 进度信息（用于日志）
+	attemptMu sync.Mutex
+	attempts  map[int32]*downloadAttempt // 正在执行的 TDLib 下载；用户暂停时取消其重试上下文
 
 	scanProgressFunc func(taskID string, scannedMessages, foundMedia, scanCursor int64) // 历史扫描进度回调（启动时注册，无并发写）
+}
+
+// monitorState 是一次完整的实时监控配置。新消息处理只读取一个快照，
+// 避免切换任务时把旧目标、新任务 ID 和新标题拼在一起。
+type monitorState struct {
+	chatID    int64
+	taskID    string
+	chatTitle string
+}
+
+type monitorGeneration struct {
+	state  monitorState
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+type downloadAttempt struct {
+	cancel context.CancelFunc
 }
 
 // fileProgress 跟踪单个文件的下载进度（仅用于日志输出）
@@ -154,18 +208,28 @@ func newClient(cfg *config.Config, log *logger.Logger, chatID int64) *Client {
 		dbDir:     filepath.Join(cfg.Session.Dir, "tdlib"),
 		filesDir:  filepath.Join(cfg.Download.Path, ".tdlib-files"),
 		fileTrack: make(map[int32]*fileProgress),
+		attempts:  make(map[int32]*downloadAttempt),
 		retrier: retry.NewDefault(log).
+			WithClassifier(tdShouldRetry, tdRetryAfter, maxFloodWait).
 			WithMaxRetries(cfg.Retry.MaxRetries).
 			WithBaseDelay(time.Duration(cfg.Retry.BaseDelay) * time.Second).
 			WithMaxDelay(time.Duration(cfg.Retry.MaxDelay) * time.Second),
 	}
-	c.targetChatID.Store(chatID)
-	c.monitorTaskID.Store("")
+	if chatID != 0 {
+		c.monitor = newMonitorGeneration(monitorState{chatID: chatID})
+	}
 	c.downloader = downloader.New(cfg.Download.Path, cfg.Download.MaxConcurrent, log)
 	c.downloader.SetDownloadFunc(c.DownloadFile)
 	c.downloader.SetPauseFunc(c.pauseDownloadFile)
+	c.downloader.SetThumbDownloadFunc(c.DownloadThumbFile)
 	c.downloader.SetClassifyByType(!cfg.Download.DisableClassifyByType)
 	c.downloader.SetSaveMetadata(cfg.Download.SaveMetadata)
+	if tpl := cfg.Download.PathTemplate; tpl != "" {
+		if problem := downloader.ValidatePathTemplate(tpl); problem != "" {
+			log.Warn("路径模板无效（%s），回退到默认布局: %s", problem, downloader.DefaultPathTemplate)
+		}
+	}
+	c.downloader.SetPathTemplate(cfg.Download.PathTemplate)
 	return c
 }
 
@@ -190,13 +254,22 @@ func (c *Client) Connect(ctx context.Context, codeFn CodeFunc, passwordFn Passwo
 	if passwordFn == nil {
 		passwordFn = scanlnPassword
 	}
-	if err := os.MkdirAll(c.dbDir, dbDirPerm); err != nil {
-		return fmt.Errorf("创建会话目录失败: %w", err)
-	}
-
 	c.credMu.Lock()
+	credentialsValid := c.config.HasAPICredentials()
 	apiID, apiHash, phone := c.config.API.ID, c.config.API.Hash, c.config.API.Phone
 	c.credMu.Unlock()
+	if !credentialsValid {
+		return errors.New("Telegram API 凭据无效")
+	}
+	if err := validateSessionDBPath(c.config.Session.Dir, c.dbDir); err != nil {
+		return fmt.Errorf("会话目录不安全: %w", err)
+	}
+	if err := ensurePrivateDir(c.dbDir); err != nil {
+		return fmt.Errorf("创建会话目录失败: %w", err)
+	}
+	if err := validateSessionDBPath(c.config.Session.Dir, c.dbDir); err != nil {
+		return fmt.Errorf("会话目录不安全: %w", err)
+	}
 
 	params := &tdclient.SetTdlibParametersRequest{
 		UseTestDc:           false,
@@ -206,7 +279,7 @@ func (c *Client) Connect(ctx context.Context, codeFn CodeFunc, passwordFn Passwo
 		UseChatInfoDatabase: true,
 		UseMessageDatabase:  true,
 		UseSecretChats:      false,
-		ApiId:               int32(apiID), //nolint:gosec // api_id 由 Telegram 分配，远小于 int32 上限
+		ApiId:               int32(apiID), //nolint:gosec // 已由 config.HasAPICredentials 校验 int32 范围
 		ApiHash:             apiHash,
 		SystemLanguageCode:  "en",
 		DeviceModel:         "Tg-Down",
@@ -214,11 +287,28 @@ func (c *Client) Connect(ctx context.Context, codeFn CodeFunc, passwordFn Passwo
 		ApplicationVersion:  appVersion,
 	}
 
-	handler := &authHandler{c: c, params: params, phone: phone, codeFn: codeFn, passwordFn: passwordFn, ctx: ctx}
+	// 代理必须在首次网络活动前启用：TDLib 不读 HTTP_PROXY/HTTPS_PROXY 等环境变量，
+	// 直连被墙的网络会永远停在"正在连接"（issue #49）。解析失败直接报错——
+	// 静默回退直连只会让用户重新面对无提示的卡死。
+	proxyReq, proxySource, err := resolveTelegramProxy(c.config.Telegram.Proxy)
+	if err != nil {
+		return err
+	}
+
+	handler := &authHandler{c: c, params: params, phone: phone, codeFn: codeFn, passwordFn: passwordFn, ctx: ctx, proxy: proxyReq}
 
 	_, _ = tdclient.SetLogVerbosityLevel(&tdclient.SetLogVerbosityLevelRequest{NewVerbosityLevel: tdlibLogVerbosity})
 
 	c.logger.Info("正在连接 Telegram (TDLib)...")
+	if proxyReq != nil {
+		c.logger.Info("经代理 %s 连接（%s）", describeProxy(proxyReq), proxySource)
+	}
+
+	// 连接停滞提示：迟迟未就绪时给出可操作的排查建议（此前只会无限期静默卡住）
+	hintDone := make(chan struct{})
+	defer close(hintDone)
+	go c.runConnectHint(proxyReq != nil, hintDone)
+
 	td, err := tdclient.NewClient(handler,
 		tdclient.WithResultHandler(tdclient.NewCallbackResultHandler(c.onUpdate)),
 		tdclient.WithFallbackTimeout(fallbackTimeout),
@@ -239,18 +329,151 @@ func (c *Client) Connect(ctx context.Context, codeFn CodeFunc, passwordFn Passwo
 	return nil
 }
 
-// Close 关闭 TDLib 客户端
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, dbDirPerm); err != nil {
+		return err
+	}
+	return os.Chmod(path, dbDirPerm)
+}
+
+func validateSessionDBPath(sessionDir, dbDir string) error {
+	expected, err := filepath.Abs(filepath.Join(sessionDir, "tdlib"))
+	if err != nil {
+		return err
+	}
+	actual, err := filepath.Abs(dbDir)
+	if err != nil {
+		return err
+	}
+	if expected != actual {
+		return fmt.Errorf("TDLib 目录不是 session.dir 的直接子目录: %s", dbDir)
+	}
+	for _, path := range []string{sessionDir, dbDir} {
+		if path == "" {
+			continue
+		}
+		if err := rejectUntrustedSymlinkComponents(path); err != nil {
+			return err
+		}
+		info, statErr := os.Lstat(filepath.Clean(path))
+		if os.IsNotExist(statErr) {
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("会话路径不是目录: %s", path)
+		}
+	}
+	return nil
+}
+
+// rejectUntrustedSymlinkComponents 从可信的本机路径前缀之后逐段检查已有路径。
+// home/cwd/TMPDIR 可能本身经过系统链接（macOS 的 /var 即常见例子），但应用控制的
+// 后续目录不允许再通过符号链接跳到别处。
+func rejectUntrustedSymlinkComponents(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	base := trustedPathBase(absPath)
+	rel, err := filepath.Rel(base, absPath)
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	current := base
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i, part := range parts {
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if os.IsNotExist(statErr) {
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("会话路径包含符号链接: %s", current)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return fmt.Errorf("会话路径分量不是目录: %s", current)
+		}
+	}
+	return nil
+}
+
+func trustedPathBase(absPath string) string {
+	volume := filepath.VolumeName(absPath)
+	best := volume + string(filepath.Separator)
+	candidates := make([]string, 0, 3)
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, cwd)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, home)
+	}
+	candidates = append(candidates, os.TempDir())
+	for _, candidate := range candidates {
+		absCandidate, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(absCandidate, absPath)
+		if err != nil || rel == ".." || filepath.IsAbs(rel) ||
+			strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		if len(absCandidate) > len(best) {
+			best = absCandidate
+		}
+	}
+	return best
+}
+
+// RemoveSessionDatabase 安全删除 <sessionDir>/tdlib，供客户端与 --clear-session 共用。
+func RemoveSessionDatabase(sessionDir string) error {
+	return removeSessionDatabase(sessionDir, filepath.Join(sessionDir, "tdlib"))
+}
+
+func removeSessionDatabase(sessionDir, dbDir string) error {
+	if err := validateSessionDBPath(sessionDir, dbDir); err != nil {
+		return err
+	}
+	return os.RemoveAll(dbDir)
+}
+
+// Close 先停止实时监控下载，再有界关闭 TDLib 客户端。可重复调用。
 func (c *Client) Close() {
+	c.stopMonitor()
+	c.cancelAllDownloadAttempts()
 	c.mu.Lock()
 	td := c.td
 	c.td = nil
 	c.mu.Unlock()
 	if td != nil {
-		_, _ = td.Close(context.Background())
+		if err := closeTDClient(td, tdCloseTimeout); err != nil {
+			c.logger.Warn("关闭 TDLib 失败: %v", err)
+		}
 	}
 }
 
-func (c *Client) client() *tdclient.Client {
+func closeTDClient(td tdAPI, timeout time.Duration) error {
+	if td == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err := tdCall(ctx, timeout, func(cc context.Context) (*tdclient.Ok, error) {
+		return td.Close(cc)
+	})
+	return err
+}
+
+func (c *Client) client() tdAPI {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.td
@@ -282,7 +505,7 @@ func tdCall[T any](ctx context.Context, timeout time.Duration, fn func(context.C
 		return zero, ctx.Err()
 	case <-timer.C:
 		var zero T
-		return zero, fmt.Errorf("TDLib 请求超时: %s", timeout)
+		return zero, fmt.Errorf("%w: %s", errTDTimeout, timeout)
 	}
 }
 
@@ -327,13 +550,28 @@ type authHandler struct {
 	codeFn     CodeFunc
 	passwordFn PasswordFunc
 	ctx        context.Context
+	// proxy 非空时在首次网络活动前经 addProxy 启用（TDLib 不读 HTTP(S)_PROXY 环境变量）
+	proxy *tdclient.AddProxyRequest
 }
 
 func (h *authHandler) Handle(td *tdclient.Client, state tdclient.AuthorizationState) error {
 	switch state.AuthorizationStateConstructor() {
 	case tdclient.ConstructorAuthorizationStateWaitTdlibParameters:
-		_, err := td.SetTdlibParameters(h.ctx, h.params)
-		return err
+		// 顺序必须是先 SetTdlibParameters 再 addProxy：实测（TDLib 1.8.64）在参数设置前
+		// 发出的 addProxy 永远得不到响应（请求方按 fallbackTimeout 挂死），而参数就绪后
+		// addProxy 立即生效并让 TDLib 改经代理重连。TDLib 不读 HTTP(S)_PROXY 环境变量，
+		// 不启用代理时被墙网络会永远卡在"正在连接"（issue #49）。
+		// 启用失败直接中止本轮认证而不是静默直连——静默直连会把问题还原成无提示的卡死。
+		if _, err := td.SetTdlibParameters(h.ctx, h.params); err != nil {
+			return err
+		}
+		if h.proxy != nil {
+			if _, err := td.AddProxy(h.ctx, h.proxy); err != nil {
+				return fmt.Errorf("启用 Telegram 代理失败: %w", err)
+			}
+			h.c.logger.Info("已启用 Telegram 代理: %s", describeProxy(h.proxy))
+		}
+		return nil
 
 	case tdclient.ConstructorAuthorizationStateWaitPhoneNumber:
 		h.c.logger.Info("提交手机号进行登录...")
@@ -407,9 +645,30 @@ func scanlnCode(_ context.Context) (string, error) {
 
 // scanlnPassword 从终端读取两步验证密码
 func scanlnPassword(_ context.Context) (string, error) {
-	fmt.Printf("请输入两步验证密码: ")
+	fd := int(os.Stdin.Fd())
+	return readPasswordInput(os.Stdin, os.Stdout, term.IsTerminal(fd), func() ([]byte, error) {
+		return term.ReadPassword(fd)
+	})
+}
+
+// readPasswordInput 将终端与管道输入分开处理。真实终端使用 hiddenRead 关闭回显；
+// 非终端输入保留按行读取，便于脚本和测试使用。
+func readPasswordInput(
+	in io.Reader, out io.Writer, terminal bool, hiddenRead func() ([]byte, error),
+) (string, error) {
+	if _, err := fmt.Fprint(out, "请输入两步验证密码: "); err != nil {
+		return "", err
+	}
+	if terminal {
+		password, err := hiddenRead()
+		_, _ = fmt.Fprintln(out)
+		if err != nil {
+			return "", err
+		}
+		return string(password), nil
+	}
 	var password string
-	if _, err := fmt.Scanln(&password); err != nil {
+	if _, err := fmt.Fscanln(in, &password); err != nil {
 		return "", err
 	}
 	return password, nil
@@ -418,21 +677,77 @@ func scanlnPassword(_ context.Context) (string, error) {
 // --- 监控目标 / 统计 / 会话 ---
 
 // SetTargetChat 设置实时监控目标（0 表示停止监控）
-func (c *Client) SetTargetChat(chatID int64) { c.targetChatID.Store(chatID) }
-
-// TargetChat 返回当前监控目标聊天ID
-func (c *Client) TargetChat() int64 { return c.targetChatID.Load() }
-
-// SetMonitorTask 设置当前监控任务ID并切换监控目标会话；taskID 为空字符串表示当前无关联任务
-func (c *Client) SetMonitorTask(taskID string, chatID int64) {
-	c.monitorTaskID.Store(taskID)
-	c.SetTargetChat(chatID)
+func (c *Client) SetTargetChat(chatID int64) {
+	c.monitorSwitchMu.Lock()
+	defer c.monitorSwitchMu.Unlock()
+	state := c.monitorSnapshot()
+	state.chatID = chatID
+	c.replaceMonitorLocked(state)
 }
 
-// monitorTask 返回当前监控关联的任务ID
-func (c *Client) monitorTask() string {
-	taskID, _ := c.monitorTaskID.Load().(string)
-	return taskID
+// TargetChat 返回当前监控目标聊天ID
+func (c *Client) TargetChat() int64 { return c.monitorSnapshot().chatID }
+
+// SetMonitorTask 设置当前监控任务ID并切换监控目标会话；taskID 为空字符串表示当前无关联任务。
+//
+// chatTitle 供路径模板的 {chat_title} 使用：由调用方（queue，已持有标题）传入而非在此查 TDLib，
+// 否则同一个聊天的实时下载会因标题是否已缓存而落到不同目录。
+func (c *Client) SetMonitorTask(taskID string, chatID int64, chatTitle string) {
+	c.monitorSwitchMu.Lock()
+	defer c.monitorSwitchMu.Unlock()
+	c.replaceMonitorLocked(monitorState{chatID: chatID, taskID: taskID, chatTitle: chatTitle})
+}
+
+func (c *Client) stopMonitor() {
+	c.monitorSwitchMu.Lock()
+	c.replaceMonitorLocked(monitorState{})
+	c.monitorSwitchMu.Unlock()
+}
+
+func newMonitorGeneration(state monitorState) *monitorGeneration {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &monitorGeneration{state: state, ctx: ctx, cancel: cancel}
+}
+
+// replaceMonitorLocked 在锁内一次替换完整监控代，再取消并等待旧代。新消息要么归入旧代
+// 并被等待，要么归入新代，不会看到空状态，也不会让旧代的 Wait 与新下载发生竞争。
+// 调用方必须持有 monitorSwitchMu。
+func (c *Client) replaceMonitorLocked(state monitorState) {
+	var next *monitorGeneration
+	if state.chatID != 0 {
+		next = newMonitorGeneration(state)
+	}
+	c.monitorMu.Lock()
+	previous := c.monitor
+	c.monitor = next
+	c.monitorMu.Unlock()
+	if previous != nil {
+		previous.cancel()
+		previous.wg.Wait()
+	}
+}
+
+func (c *Client) monitorSnapshot() monitorState {
+	c.monitorMu.RLock()
+	defer c.monitorMu.RUnlock()
+	if c.monitor == nil {
+		return monitorState{}
+	}
+	state := c.monitor.state
+	return state
+}
+
+func (c *Client) beginMonitorDownload(
+	chatID int64,
+) (monitorState, context.Context, func(), bool) {
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
+	current := c.monitor
+	if current == nil || current.state.chatID != chatID {
+		return monitorState{}, nil, nil, false
+	}
+	current.wg.Add(1)
+	return current.state, current.ctx, current.wg.Done, true
 }
 
 // Stats 返回下载统计快照
@@ -502,7 +817,7 @@ func (c *Client) SetScanProgressFunc(fn func(taskID string, scannedMessages, fou
 }
 
 // SetRecordFunc 设置下载记录回调，用于持久化下载历史
-func (c *Client) SetRecordFunc(fn func(context.Context, downloader.RecordEvent)) {
+func (c *Client) SetRecordFunc(fn func(context.Context, *downloader.RecordEvent)) {
 	c.downloader.SetRecordFunc(fn)
 }
 
@@ -522,7 +837,7 @@ func (c *Client) Phone() string {
 func (c *Client) HasCredentials() bool {
 	c.credMu.Lock()
 	defer c.credMu.Unlock()
-	return c.config.API.ID != 0 && c.config.API.Hash != "" && c.config.API.Phone != ""
+	return c.config.HasAPICredentials()
 }
 
 // SetCredentials 注入 API 凭据（Web 端登录用）；下次 Connect 生效
@@ -544,7 +859,7 @@ func (c *Client) SaveConfig() error {
 // ClearSession 清除 TDLib 会话（删除数据库目录，强制重新登录）
 func (c *Client) ClearSession() error {
 	c.Close()
-	if err := os.RemoveAll(c.dbDir); err != nil {
+	if err := removeSessionDatabase(c.config.Session.Dir, c.dbDir); err != nil {
 		return fmt.Errorf("清除会话失败: %w", err)
 	}
 	c.logger.Info("会话已清除，下次启动需要重新登录")
@@ -597,7 +912,9 @@ func (c *Client) Logout(ctx context.Context) error {
 	c.closedCh = nil
 	c.mu.Unlock()
 
-	_ = os.RemoveAll(c.dbDir)
+	if err := removeSessionDatabase(c.config.Session.Dir, c.dbDir); err != nil {
+		c.logger.Warn("清理 TDLib 会话目录失败: %v", err)
+	}
 	c.SetTargetChat(0)
 	c.logger.Info("已退出登录，会话已销毁")
 	return c.ClearPhone()
@@ -650,7 +967,7 @@ func (c *Client) GetChats(ctx context.Context) ([]ChatInfo, error) {
 
 // savedMessagesChat 返回收藏夹（Saved Messages，即与自己的私聊）条目；
 // chatInfoOf 会过滤所有私聊，故此处显式构建并置顶，即使收藏夹为空或不在聊天列表也可选。失败返回 nil 不阻塞列表
-func (c *Client) savedMessagesChat(ctx context.Context, td *tdclient.Client) *ChatInfo {
+func (c *Client) savedMessagesChat(ctx context.Context, td tdAPI) *ChatInfo {
 	me, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.User, error) {
 		return td.GetMe(cc)
 	})
@@ -669,7 +986,7 @@ func (c *Client) savedMessagesChat(ctx context.Context, td *tdclient.Client) *Ch
 }
 
 // loadAllChats 反复调用 LoadChats 把指定列表全部载入本地缓存，直到 404（无更多）
-func (c *Client) loadAllChats(ctx context.Context, td *tdclient.Client, list tdclient.ChatList) {
+func (c *Client) loadAllChats(ctx context.Context, td tdAPI, list tdclient.ChatList) {
 	for {
 		_, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Ok, error) {
 			return td.LoadChats(cc, &tdclient.LoadChatsRequest{ChatList: list, Limit: chatLoadBatch})
@@ -721,7 +1038,104 @@ func (c *Client) extractMediaInfo(m *tdclient.Message) *downloader.MediaInfo {
 	mi.AlbumID = int64(m.MediaAlbumId)
 	mi.Caption = captionText(m.Content)
 	mi.SenderID = senderID(m.SenderId)
+	attachThumbnail(mi, m.Content)
 	return mi
+}
+
+// attachThumbnail 提取缩略图信息：
+//   - Minithumb 随消息免费返回（约 40x40 的 JPEG，几百字节），零下载成本，画廊拿它做即时占位图；
+//   - ThumbFileID 指向真正的缩略图文件，需单独下载一次（小文件）。
+//
+// 照片没有 Thumbnail 字段，取 Sizes 里最小的一档当缩略图——总不能为了画廊网格
+// 把每张 4000px 的原图都塞给浏览器。
+func attachThumbnail(mi *downloader.MediaInfo, content tdclient.MessageContent) {
+	file, mini := contentThumbs(content)
+	if mini != nil {
+		mi.Minithumb = mini.Data
+	}
+	if file != nil {
+		mi.ThumbFileID = file.Id
+		if file.Remote != nil {
+			mi.ThumbUniqueID = file.Remote.UniqueId
+		}
+	}
+}
+
+// contentThumbs 按内容类型取出缩略图文件与 minithumbnail（均可为 nil）。
+// 各 *Thumbs 取值器自行处理容器为 nil 的情况，因此这里不必逐个写 nil 判断。
+func contentThumbs(content tdclient.MessageContent) (*tdclient.File, *tdclient.Minithumbnail) {
+	switch c := content.(type) {
+	case *tdclient.MessagePhoto:
+		return photoThumbs(c.Photo)
+	case *tdclient.MessageVideo:
+		if c.Video == nil {
+			return nil, nil
+		}
+		return thumbFile(c.Video.Thumbnail), c.Video.Minithumbnail
+	case *tdclient.MessageDocument:
+		if c.Document == nil {
+			return nil, nil
+		}
+		return thumbFile(c.Document.Thumbnail), c.Document.Minithumbnail
+	case *tdclient.MessageAnimation:
+		if c.Animation == nil {
+			return nil, nil
+		}
+		return thumbFile(c.Animation.Thumbnail), c.Animation.Minithumbnail
+	case *tdclient.MessageAudio:
+		if c.Audio == nil {
+			return nil, nil
+		}
+		return thumbFile(c.Audio.AlbumCoverThumbnail), c.Audio.AlbumCoverMinithumbnail
+	case *tdclient.MessageVideoNote:
+		if c.VideoNote == nil {
+			return nil, nil
+		}
+		return thumbFile(c.VideoNote.Thumbnail), c.VideoNote.Minithumbnail
+	case *tdclient.MessageSticker:
+		if c.Sticker == nil {
+			return nil, nil
+		}
+		return thumbFile(c.Sticker.Thumbnail), nil // 贴纸没有 minithumbnail
+	default:
+		return nil, nil
+	}
+}
+
+// photoThumbs 取照片的缩略图：照片没有 Thumbnail 字段，用 Sizes 里最小的一档
+func photoThumbs(photo *tdclient.Photo) (*tdclient.File, *tdclient.Minithumbnail) {
+	if photo == nil {
+		return nil, nil
+	}
+	return smallestPhotoFile(photo), photo.Minithumbnail
+}
+
+// thumbFile 从 Thumbnail 里取出文件（容器或文件为 nil 时返回 nil）
+func thumbFile(t *tdclient.Thumbnail) *tdclient.File {
+	if t == nil {
+		return nil
+	}
+	return t.File
+}
+
+// smallestPhotoFile 返回照片中面积最小的可用 size 对应的文件（照片没有独立的缩略图字段）
+func smallestPhotoFile(photo *tdclient.Photo) *tdclient.File {
+	if photo == nil {
+		return nil
+	}
+	var best *tdclient.PhotoSize
+	for _, s := range photo.Sizes {
+		if s == nil || s.Photo == nil {
+			continue
+		}
+		if best == nil || int64(s.Width)*int64(s.Height) < int64(best.Width)*int64(best.Height) {
+			best = s
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	return best.Photo
 }
 
 // captionText 提取消息内容的 caption 文本（无 caption 的类型返回空串）
@@ -764,42 +1178,99 @@ func (c *Client) extractMediaFile(m *tdclient.Message) *downloader.MediaInfo {
 	if m == nil || m.Content == nil {
 		return nil
 	}
+	// 各分支统一走"nil 安全取字段 → mediaFromFile"：容器为 nil 时字段取到零值，
+	// mediaFromFile 见 file==nil 即返回 nil，因此这里不必逐个写 nil 判断。
 	switch content := m.Content.(type) {
 	case *tdclient.MessagePhoto:
-		return mediaFromFile(m, largestPhotoFile(content.Photo), mediaTypePhoto,
+		return mediaFromFile(m, largestPhotoFile(content.Photo), mediapkg.Photo,
 			fmt.Sprintf("photo_%d_%d.jpg", m.ChatId, m.Id), "image/jpeg")
 	case *tdclient.MessageDocument:
-		if content.Document == nil {
-			return nil
-		}
-		return mediaFromFile(m, content.Document.Document, mediaTypeDocument,
-			docName(content.Document.FileName, m.Id), content.Document.MimeType)
+		f, name, mime := documentFields(content.Document)
+		return mediaFromFile(m, f, mediapkg.Document, docName(name, m.Id), mime)
 	case *tdclient.MessageVideo:
-		if content.Video == nil {
-			return nil
-		}
-		return mediaFromFile(m, content.Video.Video, mediaTypeVideo,
-			docName(content.Video.FileName, m.Id), content.Video.MimeType)
+		f, name, mime := videoFields(content.Video)
+		return mediaFromFile(m, f, mediapkg.Video, docName(name, m.Id), mime)
 	case *tdclient.MessageAnimation:
-		if content.Animation == nil {
-			return nil
-		}
-		return mediaFromFile(m, content.Animation.Animation, mediaTypeAnimation,
-			docName(content.Animation.FileName, m.Id), content.Animation.MimeType)
+		f, name, mime := animationFields(content.Animation)
+		return mediaFromFile(m, f, mediapkg.Animation, docName(name, m.Id), mime)
 	case *tdclient.MessageAudio:
-		if content.Audio == nil {
-			return nil
-		}
-		return mediaFromFile(m, content.Audio.Audio, mediaTypeAudio,
-			docName(content.Audio.FileName, m.Id), content.Audio.MimeType)
+		f, name, mime := audioFields(content.Audio)
+		return mediaFromFile(m, f, mediapkg.Audio, docName(name, m.Id), mime)
 	case *tdclient.MessageVoiceNote:
-		if content.VoiceNote == nil {
-			return nil
-		}
-		return mediaFromFile(m, content.VoiceNote.Voice, mediaTypeVoice,
-			fmt.Sprintf("voice_%d_%d.ogg", m.ChatId, m.Id), content.VoiceNote.MimeType)
+		f, mime := voiceFields(content.VoiceNote)
+		return mediaFromFile(m, f, mediapkg.Voice,
+			fmt.Sprintf("voice_%d_%d.ogg", m.ChatId, m.Id), mime)
+	case *tdclient.MessageSticker:
+		// 贴纸没有 FileName/MimeType，文件名与扩展名都得合成
+		f, ext, mime := stickerFields(content.Sticker)
+		return mediaFromFile(m, f, mediapkg.Sticker,
+			fmt.Sprintf("sticker_%d_%d%s", m.ChatId, m.Id, ext), mime)
+	case *tdclient.MessageVideoNote:
+		// 圆形视频消息同样没有 FileName/MimeType，固定 mp4
+		return mediaFromFile(m, videoNoteFile(content.VideoNote), mediapkg.VideoNote,
+			fmt.Sprintf("video_note_%d_%d.mp4", m.ChatId, m.Id), "video/mp4")
 	default:
 		return nil
+	}
+}
+
+// 以下 *Fields 取值器统一处理"容器可能为 nil"：返回零值即可，由 mediaFromFile 兜底成 nil。
+
+func documentFields(d *tdclient.Document) (f *tdclient.File, name, mime string) {
+	if d == nil {
+		return nil, "", ""
+	}
+	return d.Document, d.FileName, d.MimeType
+}
+
+func videoFields(v *tdclient.Video) (f *tdclient.File, name, mime string) {
+	if v == nil {
+		return nil, "", ""
+	}
+	return v.Video, v.FileName, v.MimeType
+}
+
+func animationFields(a *tdclient.Animation) (f *tdclient.File, name, mime string) {
+	if a == nil {
+		return nil, "", ""
+	}
+	return a.Animation, a.FileName, a.MimeType
+}
+
+func audioFields(a *tdclient.Audio) (f *tdclient.File, name, mime string) {
+	if a == nil {
+		return nil, "", ""
+	}
+	return a.Audio, a.FileName, a.MimeType
+}
+
+func voiceFields(v *tdclient.VoiceNote) (f *tdclient.File, mime string) {
+	if v == nil {
+		return nil, ""
+	}
+	return v.Voice, v.MimeType
+}
+
+func videoNoteFile(v *tdclient.VideoNote) *tdclient.File {
+	if v == nil {
+		return nil
+	}
+	return v.Video
+}
+
+// stickerFields 取贴纸文件，并按 StickerFormat 决定扩展名与 MIME：
+// webp = 静态贴纸，tgs = Lottie 动画（gzip 压缩的 JSON），webm = 视频贴纸。
+func stickerFields(s *tdclient.Sticker) (f *tdclient.File, ext, mime string) {
+	if s == nil {
+		return nil, "", ""
+	}
+	switch s.Format.(type) {
+	case *tdclient.StickerFormatTgs:
+		return s.Sticker, extTgs, "application/x-tgsticker"
+	case *tdclient.StickerFormatWebm:
+		return s.Sticker, extWebm, "video/webm"
+	default: // StickerFormatWebp 及未来可能新增的格式
+		return s.Sticker, extWebp, "image/webp"
 	}
 }
 
@@ -872,12 +1343,21 @@ func (c *Client) DownloadFile(ctx context.Context, media *downloader.MediaInfo, 
 	if td == nil {
 		return errors.New("TDLib 未连接")
 	}
-	return c.retrier.Do(ctx, func() error {
+	attemptCtx, attempt := c.beginDownloadAttempt(ctx, media.TDFileID)
+	defer c.finishDownloadAttempt(media.TDFileID, attempt)
+	// 任务取消时 tdCall 会立即返回，但底层同步传输仍使用 background context；
+	// 主动通知 TDLib 取消，避免它在后台继续占用网络与缓存文件。
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = c.cancelTDDownload(context.Background(), td, media.TDFileID)
+	})
+	defer stopCancel()
+
+	return c.retrier.Do(attemptCtx, func() error {
 		c.logger.Info("下载文件: %s (大小: %d bytes)", media.FileName, media.FileSize)
 		c.registerProgress(media)
 		defer c.unregisterProgress(media.TDFileID)
 
-		file, err := tdCall(ctx, fallbackTimeout, func(cc context.Context) (*tdclient.File, error) {
+		file, err := tdCall(attemptCtx, downloadTimeout(media.FileSize), func(cc context.Context) (*tdclient.File, error) {
 			return td.DownloadFile(cc, &tdclient.DownloadFileRequest{
 				FileId:      media.TDFileID,
 				Priority:    downloadPriority,
@@ -887,13 +1367,83 @@ func (c *Client) DownloadFile(ctx context.Context, media *downloader.MediaInfo, 
 			})
 		})
 		if err != nil {
+			// 超时后主动取消底层下载，让 TDLib 释放该文件的传输资源
+			if errors.Is(err, errTDTimeout) {
+				_ = c.cancelTDDownload(context.Background(), td, media.TDFileID)
+			}
 			return fmt.Errorf("下载文件失败: %w", err)
 		}
 		if file.Local == nil || !file.Local.IsDownloadingCompleted || file.Local.Path == "" {
-			return fmt.Errorf("下载未完成: %s", media.FileName)
+			return fmt.Errorf("%w: %s", errDownloadIncomplete, media.FileName)
 		}
 		return c.moveWithRetry(file.Local.Path, filePath)
 	})
+}
+
+func (c *Client) beginDownloadAttempt(ctx context.Context, fileID int32) (context.Context, *downloadAttempt) {
+	attemptCtx, cancel := context.WithCancel(ctx)
+	attempt := &downloadAttempt{cancel: cancel}
+	c.attemptMu.Lock()
+	c.attempts[fileID] = attempt
+	c.attemptMu.Unlock()
+	return attemptCtx, attempt
+}
+
+func (c *Client) finishDownloadAttempt(fileID int32, attempt *downloadAttempt) {
+	attempt.cancel()
+	c.attemptMu.Lock()
+	if c.attempts[fileID] == attempt {
+		delete(c.attempts, fileID)
+	}
+	c.attemptMu.Unlock()
+}
+
+func (c *Client) cancelDownloadAttempt(fileID int32) {
+	c.attemptMu.Lock()
+	attempt := c.attempts[fileID]
+	c.attemptMu.Unlock()
+	if attempt != nil {
+		attempt.cancel()
+	}
+}
+
+func (c *Client) cancelAllDownloadAttempts() {
+	c.attemptMu.Lock()
+	attempts := make([]*downloadAttempt, 0, len(c.attempts))
+	for _, attempt := range c.attempts {
+		attempts = append(attempts, attempt)
+	}
+	c.attemptMu.Unlock()
+	for _, attempt := range attempts {
+		attempt.cancel()
+	}
+}
+
+// DownloadThumbFile 下载一个缩略图文件到 destPath。
+//
+// 与主文件下载刻意分开：缩略图不进进度表（否则 UI 上每个媒体会冒出两条进度）、
+// 不走 retrier（缩略图失败无关紧要，重试的代价高过收益）、失败只返回错误由调用方吞掉。
+func (c *Client) DownloadThumbFile(ctx context.Context, fileID int32, destPath string) error {
+	td := c.client()
+	if td == nil {
+		return errors.New("TDLib 未连接")
+	}
+	file, err := tdCall(ctx, thumbDownloadTimeout, func(cc context.Context) (*tdclient.File, error) {
+		return td.DownloadFile(cc, &tdclient.DownloadFileRequest{
+			FileId:      fileID,
+			Priority:    thumbDownloadPriority,
+			Offset:      0,
+			Limit:       0,
+			Synchronous: true,
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("下载缩略图失败: %w", err)
+	}
+	if file.Local == nil || !file.Local.IsDownloadingCompleted || file.Local.Path == "" {
+		return errDownloadIncomplete
+	}
+	return c.moveWithRetry(file.Local.Path, destPath)
 }
 
 func (c *Client) pauseDownloadFile(ctx context.Context, media *downloader.MediaInfo) error {
@@ -901,26 +1451,44 @@ func (c *Client) pauseDownloadFile(ctx context.Context, media *downloader.MediaI
 	if td == nil {
 		return errors.New("TDLib 未连接")
 	}
+	// 先终止 retrier，确保 CancelDownloadFile 导致当前请求返回“未完成”时不会自动重启。
+	c.cancelDownloadAttempt(media.TDFileID)
+	return c.cancelTDDownload(ctx, td, media.TDFileID)
+}
+
+func (c *Client) cancelTDDownload(ctx context.Context, td tdAPI, fileID int32) error {
 	_, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Ok, error) {
 		return td.CancelDownloadFile(cc, &tdclient.CancelDownloadFileRequest{
-			FileId:        media.TDFileID,
+			FileId:        fileID,
 			OnlyIfPending: false,
 		})
 	})
 	return err
 }
 
-// moveWithRetry 将 TDLib 缓存文件移动到目标路径，跨设备时回退为复制
+// moveWithRetry 将 TDLib 缓存文件移动到目标路径。
+//
+// 按失败原因分流，而不是对任何错误都盲目重试 5 次：
+//   - EXDEV（跨文件系统）：rename 永远不可能成功，直接复制，重试纯属浪费；
+//   - ENOSPC（磁盘已满）：重试同样注定失败。立即返回，避免每个文件白等 2.5 秒——
+//     一个几千文件的任务在磁盘满时会空转数小时；
+//   - 其余错误（如 Windows 上的文件占用、瞬时锁）：短暂重试仍有意义。
 func (c *Client) moveWithRetry(src, dst string) error {
 	var err error
 	for attempt := 0; attempt < MaxRenameRetries; attempt++ {
 		if err = os.Rename(src, dst); err == nil {
 			return nil
 		}
+		if errors.Is(err, syscall.EXDEV) {
+			break // 跨设备：直接走复制回退
+		}
+		if errors.Is(err, syscall.ENOSPC) {
+			return fmt.Errorf("磁盘空间不足，移动文件失败: %w", err)
+		}
 		c.logger.Warn("移动文件失败 (尝试 %d): %v", attempt+1, err)
 		time.Sleep(RenameSleepDuration)
 	}
-	// 回退：跨设备无法 rename，改为复制后删除源文件
+
 	if copyErr := copyFile(src, dst); copyErr != nil {
 		return fmt.Errorf("移动文件失败: %w", copyErr)
 	}
@@ -938,24 +1506,29 @@ func copyFile(src, dst string) error {
 	}
 	defer func() { _ = in.Close() }()
 
-	tmp := filepath.Clean(dst) + ".part"
-	out, err := os.Create(tmp) // #nosec G304 -- tmp 由内部下载计划路径派生
+	tmp, err := os.CreateTemp(filepath.Dir(filepath.Clean(dst)), ".td-copy-*")
 	if err != nil {
 		return err
 	}
+	tmpName := tmp.Name()
 
 	buf := make([]byte, copyBufferSize)
-	if _, err = io.CopyBuffer(out, in, buf); err != nil {
-		_ = out.Close()
-		_ = os.Remove(tmp)
+	if _, err = io.CopyBuffer(tmp, in, buf); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
-	if err = out.Close(); err != nil {
-		_ = os.Remove(tmp)
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
-	if err = os.Rename(tmp, filepath.Clean(dst)); err != nil {
-		_ = os.Remove(tmp)
+	if err = tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err = os.Rename(tmpName, filepath.Clean(dst)); err != nil {
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return nil
@@ -974,14 +1547,18 @@ func (c *Client) unregisterProgress(fileID int32) {
 	c.trackMu.Unlock()
 }
 
-// historyCountFilters 将媒体类型映射到服务端计数过滤器，与 extractMediaInfo 支持的类型一一对应
+// historyCountFilters 将媒体类型映射到服务端过滤器，用于枚举与计数。
+//
+// 只覆盖 media.HasServerFilter 为真的类型——贴纸没有对应的 TDLib 过滤器，故不在此表中。
+// TestServerFilterCoverage 强制本表与 media 包的类型集保持同步。
 var historyCountFilters = map[string]tdclient.SearchMessagesFilter{
-	mediaTypePhoto:     &tdclient.SearchMessagesFilterPhoto{},
-	mediaTypeVideo:     &tdclient.SearchMessagesFilterVideo{},
-	mediaTypeDocument:  &tdclient.SearchMessagesFilterDocument{},
-	mediaTypeAudio:     &tdclient.SearchMessagesFilterAudio{},
-	mediaTypeVoice:     &tdclient.SearchMessagesFilterVoiceNote{},
-	mediaTypeAnimation: &tdclient.SearchMessagesFilterAnimation{},
+	mediapkg.Photo:     &tdclient.SearchMessagesFilterPhoto{},
+	mediapkg.Video:     &tdclient.SearchMessagesFilterVideo{},
+	mediapkg.Document:  &tdclient.SearchMessagesFilterDocument{},
+	mediapkg.Audio:     &tdclient.SearchMessagesFilterAudio{},
+	mediapkg.Voice:     &tdclient.SearchMessagesFilterVoiceNote{},
+	mediapkg.Animation: &tdclient.SearchMessagesFilterAnimation{},
+	mediapkg.VideoNote: &tdclient.SearchMessagesFilterVideoNote{},
 }
 
 // SendSelfMessage 向自己的 Saved Messages 发送一条文本消息（用于任务完成通知）
@@ -1016,13 +1593,6 @@ func (c *Client) SendSelfMessage(ctx context.Context, text string) error {
 	return nil
 }
 
-// ResolvedTarget 是 t.me 链接/公开用户名的解析结果；MessageID 非 0 表示指向单条消息
-type ResolvedTarget struct {
-	ChatID    int64  `json:"chat_id"`
-	Title     string `json:"chat_title"`
-	MessageID int64  `json:"message_id,omitempty"`
-}
-
 // ResolveTarget 解析下载目标：支持 @用户名、t.me/<name>、t.me/<name>/<msg>、
 // t.me/c/<id>/<msg> 及带 https:// 前缀的等价形式。私有链接要求当前账号可访问该聊天。
 func (c *Client) ResolveTarget(ctx context.Context, input string) (ResolvedTarget, error) {
@@ -1050,7 +1620,7 @@ func (c *Client) ResolveTarget(ctx context.Context, input string) (ResolvedTarge
 }
 
 // resolveMessageLink 经 GetMessageLinkInfo 解析消息链接
-func (c *Client) resolveMessageLink(ctx context.Context, td *tdclient.Client, url string) (ResolvedTarget, error) {
+func (c *Client) resolveMessageLink(ctx context.Context, td tdAPI, url string) (ResolvedTarget, error) {
 	info, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.MessageLinkInfo, error) {
 		return td.GetMessageLinkInfo(cc, &tdclient.GetMessageLinkInfoRequest{Url: url})
 	})
@@ -1072,8 +1642,24 @@ func (c *Client) resolveMessageLink(ctx context.Context, td *tdclient.Client, ur
 	return target, nil
 }
 
+// ChatTitle 查询聊天标题（失败返回空串）。供 CLI 填充 HistorySpec.ChatTitle：
+// 少了它，同一个聊天用 CLI 下和用 Web 下会因 {chat_title} 展开不同而落到两个目录。
+func (c *Client) ChatTitle(ctx context.Context, chatID int64) string {
+	td := c.client()
+	if td == nil {
+		return ""
+	}
+	chat, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Chat, error) {
+		return td.GetChat(cc, &tdclient.GetChatRequest{ChatId: chatID})
+	})
+	if err != nil {
+		return ""
+	}
+	return chat.Title
+}
+
 // resolvePublicChat 按公开用户名解析聊天
-func (c *Client) resolvePublicChat(ctx context.Context, td *tdclient.Client, username string) (ResolvedTarget, error) {
+func (c *Client) resolvePublicChat(ctx context.Context, td tdAPI, username string) (ResolvedTarget, error) {
 	if username == "" {
 		return ResolvedTarget{}, errors.New("用户名不能为空")
 	}
@@ -1089,21 +1675,29 @@ func (c *Client) resolvePublicChat(ctx context.Context, td *tdclient.Client, use
 // CountHistoryMedia 统计聊天历史中可下载媒体的总数（服务端近似值）。
 // mediaTypes 非空时只统计选中的类型；日期/大小过滤无法在服务端预估，结果为上估。
 // 单个过滤器失败仅跳过；全部失败返回错误，调用方回退为未知总数。
+//
+// 选中的类型里只要有一个无服务端计数能力（贴纸），总数就返回 0（= 未知）：
+// 拿其余类型的和当分母，分子却含贴纸，进度条会冲破 100%。宁可没有分母，也不要错的分母。
 func (c *Client) CountHistoryMedia(ctx context.Context, chatID int64, mediaTypes []string) (int64, error) {
 	td := c.client()
 	if td == nil {
 		return 0, errors.New("TDLib 未连接")
 	}
-	selected := make([]tdclient.SearchMessagesFilter, 0, len(historyCountFilters))
-	if len(mediaTypes) == 0 {
-		for _, f := range historyCountFilters {
-			selected = append(selected, f)
+	types := mediaTypes
+	if len(types) == 0 {
+		types = mediapkg.DefaultTypes
+	}
+	for _, t := range types {
+		if !mediapkg.HasServerFilter(t) {
+			c.logger.Info("类型 %s 无服务端计数能力，本任务总数按未知处理", t)
+			return 0, nil
 		}
-	} else {
-		for _, t := range mediaTypes {
-			if f, ok := historyCountFilters[t]; ok {
-				selected = append(selected, f)
-			}
+	}
+
+	selected := make([]tdclient.SearchMessagesFilter, 0, len(types))
+	for _, t := range types {
+		if f, ok := historyCountFilters[t]; ok {
+			selected = append(selected, f)
 		}
 	}
 	var total int64
@@ -1137,11 +1731,17 @@ func (c *Client) CountHistoryMedia(ctx context.Context, chatID int64, mediaTypes
 }
 
 // DownloadHistoryMedia 按 spec 下载聊天历史媒体：整聊天任务从游标续扫并流水线分发下载，
-// 单消息任务（spec.MessageID != 0）只下载指定消息；恢复任务先补下被重启清扫的中断行
-func (c *Client) DownloadHistoryMedia(ctx context.Context, spec *downloader.HistorySpec) error {
+// 单消息任务（spec.MessageID != 0）只下载指定消息；恢复任务先补下被重启清扫的中断行。
+//
+// 返回值 HistoryResult 汇总本次运行的单文件失败数。error 只表示"任务级"失败（扫描出错、
+// 聊天不可访问、被取消）——单个文件下载失败不会中止任务，但会计入 result.Failed，
+// 由调用方决定任务终态。
+func (c *Client) DownloadHistoryMedia(
+	ctx context.Context, spec *downloader.HistorySpec,
+) (*downloader.HistoryResult, error) {
 	td := c.client()
 	if td == nil {
-		return errors.New("TDLib 未连接")
+		return &downloader.HistoryResult{}, errors.New("TDLib 未连接")
 	}
 	if spec.FromMessageID > 0 {
 		c.logger.Info("继续下载聊天 %d 的历史媒体文件（游标 %d）", spec.ChatID, spec.FromMessageID)
@@ -1151,77 +1751,103 @@ func (c *Client) DownloadHistoryMedia(ctx context.Context, spec *downloader.Hist
 
 	closeChat, err := c.openChatForHistory(ctx, td, spec.ChatID)
 	if err != nil {
-		return err
+		return &downloader.HistoryResult{}, err
 	}
 	if closeChat != nil {
 		defer closeChat()
 	}
 
-	// 扫描与下载流水线：扫描 goroutine 持续翻页发现媒体并立即分发下载，
-	// sem 限制扫描最多领先下载 partitionSize 个在途媒体（内存与队列长度上界）
+	pipe := c.newDownloadPipeline(ctx)
+	defer pipe.wait()
+
+	scan, runErr := c.runHistorySpec(ctx, td, spec, pipe)
+	pipe.wait()
+	return &downloader.HistoryResult{
+		Failed:       pipe.failed.Load(),
+		MaxMessageID: scan.maxMessageID,
+	}, runErr
+}
+
+// runHistorySpec 按 spec 的形态选择执行路径，把发现的媒体投入下载流水线。
+// 返回的 error 只表示任务级失败；单文件失败由 pipeline 计数。
+func (c *Client) runHistorySpec(
+	ctx context.Context, td tdAPI, spec *downloader.HistorySpec, pipe *downloadPipeline,
+) (scanOutcome, error) {
+	// 单消息任务（t.me 消息链接）：只下载指定消息，不扫描历史
+	if spec.MessageID != 0 {
+		return scanOutcome{}, c.downloadSingleHistoryMessage(ctx, td, spec, pipe.dispatch)
+	}
+
+	// 恢复/重试任务先补下失败的行：这些消息可能比游标更新，续扫不会再经过
+	if len(spec.RetryMessageIDs) > 0 {
+		if err := c.retryInterruptedMessages(ctx, td, spec, pipe.dispatch); err != nil {
+			return scanOutcome{}, err
+		}
+	}
+
+	// RetryOnly：历史已完整扫过，本次只补失败的文件——重扫一遍不会有任何新发现
+	if spec.RetryOnly {
+		return scanOutcome{}, nil
+	}
+
+	scan, scanErr := c.scanHistoryPages(ctx, td, spec, pipe.dispatch)
+	if scanErr != nil {
+		return scan, scanErr
+	}
+	c.logger.Info("历史扫描完成: 共扫描 %d 条消息，发现 %d 个媒体", scan.scannedMessages, scan.foundMedia)
+	return scan, nil
+}
+
+// downloadPipeline 是扫描与下载之间的流水线：扫描一发现媒体就分发下载，
+// sem 限制扫描最多领先下载 partitionSize 个在途媒体（内存与队列长度上界）。
+type downloadPipeline struct {
+	wg         sync.WaitGroup
+	failed     atomic.Int64
+	sem        chan struct{}
+	dispatchFn func(*downloader.MediaInfo) error
+}
+
+// newDownloadPipeline 建立下载流水线，在途上限取自 download.partition_size
+func (c *Client) newDownloadPipeline(ctx context.Context) *downloadPipeline {
 	partitionSize := c.config.Download.PartitionSize
 	if partitionSize <= 0 {
 		partitionSize = config.DefaultPartitionSize
 	}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, partitionSize)
-
-	// dispatch 将单个媒体投入下载流水线（受 sem 在途上限约束）
-	dispatch := func(mi *downloader.MediaInfo) error {
+	p := &downloadPipeline{sem: make(chan struct{}, partitionSize)}
+	p.dispatchFn = func(mi *downloader.MediaInfo) error {
 		select {
-		case sem <- struct{}{}:
+		case p.sem <- struct{}{}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-		wg.Add(1)
+		p.wg.Add(1)
 		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
+			defer p.wg.Done()
+			defer func() { <-p.sem }()
 			if err := c.downloader.DownloadMedia(ctx, mi); err != nil {
+				// 单个文件失败不中止任务（一个文件挂了不该让其余几千个停下），但必须计数：
+				// 此前这里只打一行日志就把错误丢掉，导致"全部文件下载失败"的任务依然被判定
+				// 为已完成——用户看到绿色的"已完成"，而一个文件都没下来。
+				// 任务取消导致的失败不计入：那是用户的意图，不是故障。
+				if ctx.Err() == nil {
+					p.failed.Add(1)
+				}
 				c.logger.Error("下载媒体文件失败: %v", err)
 			}
 		}()
 		return nil
 	}
-
-	// 单消息任务（t.me 消息链接）：只下载指定消息，不扫描历史
-	if spec.MessageID != 0 {
-		err := c.downloadSingleHistoryMessage(ctx, td, spec, dispatch)
-		wg.Wait()
-		if err != nil {
-			return err
-		}
-		c.downloader.PrintStats()
-		return nil
-	}
-
-	// 恢复任务先补下被重启清扫的中断行：这些消息比游标更新，续扫不会再经过
-	if len(spec.RetryMessageIDs) > 0 {
-		if err := c.retryInterruptedMessages(ctx, td, spec, dispatch); err != nil {
-			wg.Wait()
-			return err
-		}
-	}
-
-	scannedMessages, foundMedia, scanErr := c.scanHistoryPages(ctx, td, spec, dispatch)
-	if scanErr == nil {
-		c.logger.Info("历史扫描完成: 共扫描 %d 条消息，发现 %d 个媒体", scannedMessages, foundMedia)
-	}
-	// 扫描出错或取消时也等在途下载全部退出，避免任务进入终态后仍有下载在更新统计
-	wg.Wait()
-	if scanErr != nil {
-		return scanErr
-	}
-
-	c.logger.Info("历史媒体文件下载完成，总计处理 %d 个文件", foundMedia)
-	c.downloader.PrintStats()
-	return nil
+	return p
 }
 
-// openChatForHistory 校验聊天可访问并打开聊天，促使 TDLib 主动从服务器同步历史；
-// 冷缓存时首批 GetChatHistory 常为空，否则可能在历史尚未拉取就误判"已完成"。
+func (p *downloadPipeline) dispatch(mi *downloader.MediaInfo) error { return p.dispatchFn(mi) }
+
+// wait 等待所有在途下载退出（可重复调用）
+func (p *downloadPipeline) wait() { p.wg.Wait() }
+
+// openChatForHistory 校验聊天可访问并打开聊天，促使 TDLib 主动从服务器同步历史。
 // 返回的 closeFn（可为 nil）应在拉取结束后调用以释放 TDLib 资源。
-func (c *Client) openChatForHistory(ctx context.Context, td *tdclient.Client, chatID int64) (closeFn func(), err error) {
+func (c *Client) openChatForHistory(ctx context.Context, td tdAPI, chatID int64) (closeFn func(), err error) {
 	if _, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Chat, error) {
 		return td.GetChat(cc, &tdclient.GetChatRequest{ChatId: chatID})
 	}); err != nil {
@@ -1239,108 +1865,111 @@ func (c *Client) openChatForHistory(ctx context.Context, td *tdclient.Client, ch
 	}, nil
 }
 
-// scanHistoryPages 从 spec.FromMessageID 起向更旧方向翻页扫描，按任务过滤器筛选并分发下载；
-// 游标随页推进经 reportScanProgress 上报持久化
+// scanHistoryPages 向更旧方向扫描聊天历史，按任务过滤器筛选并分发下载。
+//
+// 优先走服务端枚举：每种媒体类型各跑一条 SearchChatMessages 流水线（该 API 一次只接受一个
+// 过滤器），服务端只回匹配的媒体消息，且结束信号由 NextFromMessageId == 0 明确给出。
+// 只要所选类型含贴纸等没有专用过滤器的类型，就改用一条 SearchMessagesFilterEmpty 流水线
+// 枚举所有消息并在本地筛选。它会多传回纯文本，但仍以 NextFromMessageId == 0 明确结束，
+// 不会像 GetChatHistory 的重复空页那样把“服务端仍在回填”误判成扫描完成。
+//
+// 游标（scan_cursor）只在单条流水线时持久化：一个整数无法表达 N 条流水线各自的位置。
+// 多流水线任务重启后从最新重扫，但扫的只是媒体消息，且已下载的文件由去重/跳过挡掉。
 func (c *Client) scanHistoryPages(
-	ctx context.Context, td *tdclient.Client, spec *downloader.HistorySpec,
+	ctx context.Context, td tdAPI, spec *downloader.HistorySpec,
 	dispatch func(*downloader.MediaInfo) error,
-) (scannedMessages, foundMedia int64, err error) {
+) (scanOutcome, error) {
 	batchSize := c.config.Download.BatchSize
 	if batchSize <= 0 || batchSize > DefaultMessageLimit {
 		batchSize = DefaultMessageLimit
 	}
 	limit := int32(batchSize) // 已上界钳制到 DefaultMessageLimit(100)，不会溢出
 
-	fromMsgID := spec.FromMessageID // 0 = 从最新开始；>0 = 断点续扫
-	emptyStreak := 0
-	lastScanLog := time.Now()
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return scannedMessages, foundMedia, err
-		}
-
-		pageMsgs, err := fetchHistoryPage(ctx, td, spec.ChatID, fromMsgID, limit)
-		if err != nil {
-			return scannedMessages, foundMedia, err
-		}
-
-		if len(pageMsgs) == 0 {
-			emptyStreak++
-			stop, err := awaitNextHistoryPage(ctx, emptyStreak)
-			if err != nil || stop {
-				return scannedMessages, foundMedia, err
-			}
-			continue
-		}
-		emptyStreak = 0
-
-		media, lastMsgID, pastDateFrom := c.extractBatchMedia(pageMsgs, spec.TaskID, spec.Filters)
-		fromMsgID = lastMsgID // 推进到本页最旧消息
-		scannedMessages += int64(len(pageMsgs))
-		foundMedia += int64(len(media))
-		// 游标随页推进即上报持久化；本页/在途媒体若在落盘后被杀，
-		// 由启动清扫（interrupted）+ 恢复补下（RetryMessageIDs）兜底，不会漏
-		c.reportScanProgress(spec.TaskID, scannedMessages, foundMedia, fromMsgID)
-
-		c.downloader.PlanBatch(media)
-		for _, m := range media {
-			if err := dispatch(m); err != nil {
-				return scannedMessages, foundMedia, err
-			}
-		}
-		if pastDateFrom {
-			c.logger.Info("历史扫描已越过起始日期，提前结束")
-			return scannedMessages, foundMedia, nil
-		}
-
-		if time.Since(lastScanLog) >= scanLogInterval {
-			c.logger.Info("扫描进度: 已扫描 %d 条消息，发现 %d 个媒体", scannedMessages, foundMedia)
-			lastScanLog = time.Now()
-		}
+	types := effectiveTypes(spec.Filters.MediaTypes)
+	filters, ok := searchFiltersFor(types)
+	if !ok {
+		start := c.scanStartID(ctx, td, spec, false)
+		c.logger.Info("所选类型需要完整历史，使用单条无过滤搜索流水线")
+		return c.scanBySearch(
+			ctx, td, spec, &tdclient.SearchMessagesFilterEmpty{}, start, limit, dispatch, scanOutcome{}, true,
+		)
 	}
+
+	multi := len(filters) > 1
+	start := c.scanStartID(ctx, td, spec, multi)
+	c.logger.Info("按类型 %v 走服务端枚举（%d 条流水线）", types, len(filters))
+
+	var res scanOutcome
+	for i, f := range filters {
+		out, err := c.scanBySearch(ctx, td, spec, f, start, limit, dispatch, res, !multi)
+		if err != nil {
+			return out, fmt.Errorf("扫描 %s 失败: %w", types[i], err)
+		}
+		res = out
+	}
+	return res, nil
 }
 
-// retryInterruptedMessages 逐条重取并补下恢复任务的中断消息；消息已删除或无媒体时记警告跳过
+// retryInterruptedMessages 逐条重取并补下恢复任务的中断消息。
+// 仍可下载的消息会先分发；已删除、无媒体或被过滤器排除的消息汇总为任务级错误，
+// 防止 RetryOnly 把没有实际恢复的失败记录误报为完成。
 func (c *Client) retryInterruptedMessages(
-	ctx context.Context, td *tdclient.Client, spec *downloader.HistorySpec,
+	ctx context.Context, td tdAPI, spec *downloader.HistorySpec,
 	dispatch func(*downloader.MediaInfo) error,
 ) error {
 	var batch []*downloader.MediaInfo
+	var unresolved []error
 	for _, msgID := range spec.RetryMessageIDs {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		msg, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Message, error) {
-			return td.GetMessage(cc, &tdclient.GetMessageRequest{ChatId: spec.ChatID, MessageId: msgID})
-		})
+		msg, err := c.getMessage(ctx, td, spec.ChatID, msgID)
 		if err != nil {
-			c.logger.Warn("补下中断媒体失败（消息 %d 可能已删除）: %v", msgID, err)
+			unresolved = append(unresolved, fmt.Errorf("补下消息 %d 获取失败: %w", msgID, err))
 			continue
 		}
-		if media := c.extractMediaInfo(msg); media != nil &&
-			spec.Filters.Match(media.MediaType, int64(msg.Date), media.FileSize) {
-			media.TaskID = spec.TaskID
-			batch = append(batch, media)
+		media := c.extractMediaInfo(msg)
+		if media == nil {
+			unresolved = append(unresolved, fmt.Errorf("补下消息 %d 不包含可下载的媒体", msgID))
+			continue
 		}
+		if !spec.Filters.Match(media) {
+			unresolved = append(unresolved, fmt.Errorf("补下消息 %d 的媒体被任务过滤器排除", msgID))
+			continue
+		}
+		media.TaskID = spec.TaskID
+		media.ChatTitle = spec.ChatTitle
+		batch = append(batch, media)
 	}
 	c.downloader.PlanBatch(batch)
 	for _, m := range batch {
 		if err := dispatch(m); err != nil {
-			return err
+			unresolved = append(unresolved, err)
+			break
 		}
 	}
-	return nil
+	return errors.Join(unresolved...)
+}
+
+// getMessage 取单条消息，经 retrier 重试（限流/网络抖动不应让补下或单消息任务直接失败）
+func (c *Client) getMessage(ctx context.Context, td tdAPI, chatID, msgID int64) (*tdclient.Message, error) {
+	var msg *tdclient.Message
+	err := c.retrier.Do(ctx, func() error {
+		var err error
+		msg, err = tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Message, error) {
+			return td.GetMessage(cc, &tdclient.GetMessageRequest{ChatId: chatID, MessageId: msgID})
+		})
+		return err
+	})
+	return msg, err
 }
 
 // downloadSingleHistoryMessage 下载单条消息的媒体（t.me 消息链接任务）
 func (c *Client) downloadSingleHistoryMessage(
-	ctx context.Context, td *tdclient.Client, spec *downloader.HistorySpec,
+	ctx context.Context, td tdAPI, spec *downloader.HistorySpec,
 	dispatch func(*downloader.MediaInfo) error,
 ) error {
-	msg, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Message, error) {
-		return td.GetMessage(cc, &tdclient.GetMessageRequest{ChatId: spec.ChatID, MessageId: spec.MessageID})
-	})
+	msg, err := c.getMessage(ctx, td, spec.ChatID, spec.MessageID)
 	if err != nil {
 		return fmt.Errorf("获取消息 %d 失败: %w", spec.MessageID, err)
 	}
@@ -1348,10 +1977,11 @@ func (c *Client) downloadSingleHistoryMessage(
 	if media == nil {
 		return fmt.Errorf("消息 %d 不包含可下载的媒体", spec.MessageID)
 	}
-	if !spec.Filters.Match(media.MediaType, int64(msg.Date), media.FileSize) {
+	if !spec.Filters.Match(media) {
 		return fmt.Errorf("消息 %d 的媒体被任务过滤器排除", spec.MessageID)
 	}
 	media.TaskID = spec.TaskID
+	media.ChatTitle = spec.ChatTitle
 	c.downloader.PlanBatch([]*downloader.MediaInfo{media})
 	return dispatch(media)
 }
@@ -1364,65 +1994,25 @@ func (c *Client) reportScanProgress(taskID string, scannedMessages, foundMedia, 
 	c.scanProgressFunc(taskID, scannedMessages, foundMedia, scanCursor)
 }
 
-// fetchHistoryPage 拉取一页历史消息，并剔除 Offset:0 时 TDLib 附带返回的
-// FromMessageId 边界消息本身（非首次请求时），避免重复处理及"仅剩边界消息"导致的死循环
-func fetchHistoryPage(ctx context.Context, td *tdclient.Client, chatID, fromMsgID int64, limit int32) ([]*tdclient.Message, error) {
-	msgs, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Messages, error) {
-		return td.GetChatHistory(cc, &tdclient.GetChatHistoryRequest{
-			ChatId:        chatID,
-			FromMessageId: fromMsgID,
-			Offset:        0,
-			Limit:         limit,
-			OnlyLocal:     false,
-		})
-	})
-	if err != nil {
-		return nil, fmt.Errorf("获取消息历史失败: %w", err)
-	}
-
-	pageMsgs := msgs.Messages
-	if fromMsgID != 0 && len(pageMsgs) > 0 && pageMsgs[0].Id == fromMsgID {
-		pageMsgs = pageMsgs[1:]
-	}
-	return pageMsgs, nil
-}
-
-// extractBatchMedia 从一页历史消息中提取媒体信息、按任务过滤器筛选并打上任务ID；
-// 返回本页最旧消息ID供调用方推进下一页起点，以及整页是否已早于 DateFrom（可提前停止翻页：
-// 历史页按新到旧返回，整页更旧则更早的页必然全部越界）
+// extractBatchMedia 从一页历史消息中提取媒体信息、按任务过滤器筛选并打上任务ID与聊天标题；
+// 同时返回整页是否已早于 DateFrom（可提前停止翻页：历史页按新到旧返回，
+// 整页更旧则更早的页必然全部越界）
 func (c *Client) extractBatchMedia(
-	msgs []*tdclient.Message, taskID string, filters downloader.HistoryFilters,
-) (media []*downloader.MediaInfo, lastMsgID int64, pastDateFrom bool) {
+	msgs []*tdclient.Message, spec *downloader.HistorySpec,
+) (media []*downloader.MediaInfo, pastDateFrom bool) {
+	filters := spec.Filters
 	pastDateFrom = len(msgs) > 0 && filters.DateFrom != 0
 	for _, m := range msgs {
 		if int64(m.Date) >= filters.DateFrom {
 			pastDateFrom = false
 		}
-		if mi := c.extractMediaInfo(m); mi != nil && filters.Match(mi.MediaType, int64(m.Date), mi.FileSize) {
-			mi.TaskID = taskID
+		if mi := c.extractMediaInfo(m); mi != nil && filters.Match(mi) {
+			mi.TaskID = spec.TaskID
+			mi.ChatTitle = spec.ChatTitle
 			media = append(media, mi)
 		}
-		lastMsgID = m.Id
 	}
-	return media, lastMsgID, pastDateFrom
-}
-
-// awaitNextHistoryPage 处理获取到空历史页时的退避逻辑：
-// 连续空页达到阈值则停止轮询（stop=true）；否则等待后允许继续下一页。
-func awaitNextHistoryPage(ctx context.Context, emptyStreak int) (stop bool, err error) {
-	if emptyStreak >= emptyHistoryRetries {
-		return true, nil
-	}
-	wait := time.Duration(emptyStreak) * emptyHistorySleep
-	if wait > maxEmptyHistorySleep {
-		wait = maxEmptyHistorySleep
-	}
-	select {
-	case <-ctx.Done():
-		return true, ctx.Err()
-	case <-time.After(wait):
-	}
-	return false, nil
+	return media, pastDateFrom
 }
 
 // --- TDLib 更新处理 ---
@@ -1496,18 +2086,23 @@ func (c *Client) onNewMessage(m *tdclient.Message) {
 	if m == nil {
 		return
 	}
-	target := c.targetChatID.Load()
-	if target == 0 || m.ChatId != target {
+	monitor, monitorCtx, monitorDone, ok := c.beginMonitorDownload(m.ChatId)
+	if !ok {
 		return
 	}
 	media := c.extractMediaInfo(m)
 	if media == nil {
+		monitorDone()
 		c.logger.Info("📝 目标聊天新消息（无媒体）: %s", messagePreview(m))
 		return
 	}
-	media.TaskID = c.monitorTask()
+	media.TaskID = monitor.taskID
+	media.ChatTitle = monitor.chatTitle
 	c.logger.Info("🎬 检测到目标聊天新媒体: %s", media.FileName)
-	go func() { c.downloader.DownloadSingle(context.Background(), media) }()
+	go func() {
+		defer monitorDone()
+		c.downloader.DownloadSingle(monitorCtx, media)
+	}()
 }
 
 // onConnectionState 输出连接状态变化
@@ -1518,10 +2113,83 @@ func (c *Client) onConnectionState(state tdclient.ConnectionState) {
 	switch state.(type) {
 	case *tdclient.ConnectionStateReady:
 		c.logger.Debug("TDLib 连接就绪")
+		c.connState.Store(ConnectionReady)
 	case *tdclient.ConnectionStateConnecting, *tdclient.ConnectionStateConnectingToProxy:
 		c.logger.Debug("TDLib 正在连接...")
+		c.connState.Store(ConnectionConnecting)
+	case *tdclient.ConnectionStateUpdating:
+		c.connState.Store(ConnectionUpdating)
 	case *tdclient.ConnectionStateWaitingForNetwork:
 		c.logger.Warn("TDLib 等待网络...")
+		c.connState.Store(ConnectionWaitingNetwork)
+	}
+}
+
+// 网络连接状态。此前 TDLib 的连接状态只写日志，界面无从得知"下载停滞是因为断网"，
+// 用户只能看着进度条不动干着急。
+const (
+	ConnectionReady          = "ready"
+	ConnectionConnecting     = "connecting"
+	ConnectionUpdating       = "updating"
+	ConnectionWaitingNetwork = "waiting_network"
+)
+
+// ConnectionState 返回当前的 TDLib 网络连接状态（未连接时为空串）
+func (c *Client) ConnectionState() string {
+	s, _ := c.connState.Load().(string)
+	return s
+}
+
+// connectionStateLabels 把内部连接状态码映射为日志可读标签
+var connectionStateLabels = map[string]string{
+	ConnectionReady:          "已连接",
+	ConnectionConnecting:     "连接中",
+	ConnectionUpdating:       "更新中",
+	ConnectionWaitingNetwork: "等待网络",
+}
+
+// connectHintDelays 可在测试中缩短的连接停滞提示节奏（首条提示、重复间隔）
+var (
+	connectHintDelay  = 30 * time.Second
+	connectHintRepeat = 5 * time.Minute
+)
+
+// runConnectHint 在 Connect 阻塞于认证/连接期间监测停滞：超过 connectHintDelay 仍未
+// 就绪就输出排查提示，之后按 connectHintRepeat 重复。此前网络不通时只会无限期静默
+// 卡在"正在连接 Telegram"，用户无从判断是程序问题还是网络问题（issue #49）。
+// done 由调用方在 Connect 返回时关闭；已进入 Ready 状态则立即退出。
+func (c *Client) runConnectHint(withProxy bool, done <-chan struct{}) {
+	c.runConnectHintWith(connectHintDelay, connectHintRepeat, withProxy, done)
+}
+
+// runConnectHintWith 是 runConnectHint 的可注入节奏版本（测试用短间隔驱动同一逻辑）。
+func (c *Client) runConnectHintWith(delay, repeat time.Duration, withProxy bool, done <-chan struct{}) {
+	start := time.Now()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-timer.C:
+		}
+		if c.ConnectionState() == ConnectionReady {
+			return
+		}
+		elapsed := time.Since(start).Round(time.Second)
+		stateLabel := connectionStateLabels[c.ConnectionState()]
+		if stateLabel == "" {
+			stateLabel = "未知"
+		}
+		if withProxy {
+			c.logger.Warn("已等待 %v 仍未连上 Telegram（状态: %s）。请检查代理服务器是否可用、代理地址与端口是否正确", elapsed, stateLabel)
+		} else {
+			c.logger.Warn(
+				"已等待 %v 仍未连上 Telegram（状态: %s）。若本机网络无法直连 Telegram，"+
+					"请配置代理：config.yaml 的 telegram.proxy 或环境变量 TG_PROXY / ALL_PROXY / HTTPS_PROXY / HTTP_PROXY（支持 socks5:// 与 http://），修改后重启生效",
+				elapsed, stateLabel)
+		}
+		timer.Reset(repeat)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 // terminalTaskStatuses 是任务的终态集合，进入这些状态时记录 finished_at
 var terminalTaskStatuses = map[string]bool{
 	TaskStatusCompleted: true,
+	TaskStatusPartial:   true,
 	TaskStatusFailed:    true,
 	TaskStatusCanceled:  true,
 }
@@ -17,16 +18,18 @@ var terminalTaskStatuses = map[string]bool{
 // CreateTask 插入一条新任务记录
 func (s *Store) CreateTask(ctx context.Context, t *TaskRow) error {
 	const q = `
-INSERT INTO tasks (id, kind, chat_id, chat_title, status, created_at, started_at, finished_at,
-                    error, total, downloaded, failed, skipped, total_size, downloaded_size, expected_total,
-                    scan_cursor, attempts, filters, message_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	INSERT INTO tasks (id, kind, chat_id, chat_title, status, created_at, started_at, finished_at,
+	                    error, total, downloaded, failed, skipped, total_size, downloaded_size, expected_total,
+	                    scan_cursor, attempts, filters, message_id, stop_at_message_id, schedule_id,
+	                    retry_failed_only)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := s.execContext(ctx, q,
 		t.ID, t.Kind, t.ChatID, t.ChatTitle, t.Status, timeToUnix(t.CreatedAt),
 		timePtrToUnix(t.StartedAt), timePtrToUnix(t.FinishedAt), nullString(t.Error),
 		t.Total, t.Downloaded, t.Failed, t.Skipped, t.TotalSize, t.DownloadedSize, t.ExpectedTotal,
-		t.ScanCursor, t.Attempts, nullString(t.Filters), t.MessageID,
+		t.ScanCursor, t.Attempts, nullString(t.Filters), t.MessageID, t.StopAtMessageID,
+		nullString(t.ScheduleID), t.RetryFailedOnly,
 	)
 	if err != nil {
 		return fmt.Errorf("创建任务失败: %w", err)
@@ -34,22 +37,41 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	return nil
 }
 
+// DeleteTask 删除尚未开始执行的任务；用于入队失败时撤销已创建的持久化行。
+func (s *Store) DeleteTask(ctx context.Context, id string) error {
+	res, err := s.execContext(ctx, `DELETE FROM tasks WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("删除任务失败: %w", err)
+	}
+	return checkRowsAffected(res, "任务", id)
+}
+
 // UpdateTaskStatus 更新任务状态与错误信息；状态首次转为 running 时记录 started_at，
-// 转为终态（completed/failed/canceled）时记录 finished_at
+// 转为终态（completed/partial/failed/canceled）时记录 finished_at。
 func (s *Store) UpdateTaskStatus(ctx context.Context, id, status, errMsg string) error {
 	const q = `
 UPDATE tasks SET
-  status = ?,
-  error = ?,
-  started_at = CASE WHEN ? = 1 AND started_at IS NULL THEN ? ELSE started_at END,
-  finished_at = CASE WHEN ? = 1 THEN ? ELSE finished_at END
-WHERE id = ?`
+	  status = ?,
+	  error = ?,
+	  started_at = CASE
+	    WHEN ? = 1 THEN NULL
+	    WHEN ? = 1 AND started_at IS NULL THEN ?
+	    ELSE started_at
+	  END,
+	  finished_at = CASE
+	    WHEN ? = 1 THEN ?
+	    WHEN ? = 1 THEN NULL
+	    ELSE finished_at
+	  END
+	WHERE id = ?`
 
 	now := time.Now().Unix()
 	isRunning := status == TaskStatusRunning
+	isQueued := status == TaskStatusQueued
 	isTerminal := terminalTaskStatuses[status]
 
-	res, err := s.execContext(ctx, q, status, nullString(errMsg), isRunning, now, isTerminal, now, id)
+	res, err := s.execContext(ctx, q, status, nullString(errMsg), isQueued, isRunning, now,
+		isTerminal, now, isQueued || isRunning, id)
 	if err != nil {
 		return fmt.Errorf("更新任务状态失败: %w", err)
 	}
@@ -62,17 +84,18 @@ type TaskProgress struct {
 	TotalSize, DownloadedSize          int64
 	ExpectedTotal, ScanCursor          int64
 	Attempts                           int
+	RetryFailedOnly                    bool
 }
 
 // UpdateTaskProgress 更新任务的进度统计与扫描游标
 func (s *Store) UpdateTaskProgress(ctx context.Context, id string, p TaskProgress) error {
 	const q = `
 UPDATE tasks SET total = ?, downloaded = ?, failed = ?, skipped = ?, total_size = ?, downloaded_size = ?,
-  expected_total = ?, scan_cursor = ?, attempts = ?
-WHERE id = ?`
+	  expected_total = ?, scan_cursor = ?, attempts = ?, retry_failed_only = ?
+	WHERE id = ?`
 
 	res, err := s.execContext(ctx, q, p.Total, p.Downloaded, p.Failed, p.Skipped, p.TotalSize,
-		p.DownloadedSize, p.ExpectedTotal, p.ScanCursor, p.Attempts, id)
+		p.DownloadedSize, p.ExpectedTotal, p.ScanCursor, p.Attempts, p.RetryFailedOnly, id)
 	if err != nil {
 		return fmt.Errorf("更新任务进度失败: %w", err)
 	}
@@ -84,9 +107,9 @@ WHERE id = ?`
 //nolint:dupl // 与 ListSchedules 结构同形但行类型/扫描器不同，泛型化收益低于可读性损失
 func (s *Store) ListTasks(ctx context.Context) ([]*TaskRow, error) {
 	const q = `
-SELECT id, kind, chat_id, chat_title, status, created_at, started_at, finished_at,
-       error, total, downloaded, failed, skipped, total_size, downloaded_size, expected_total,
-       scan_cursor, attempts, filters, message_id
+	SELECT id, kind, chat_id, chat_title, status, created_at, started_at, finished_at,
+	       error, total, downloaded, failed, skipped, total_size, downloaded_size, expected_total,
+	       scan_cursor, attempts, filters, message_id, stop_at_message_id, schedule_id, retry_failed_only
 FROM tasks ORDER BY created_at DESC`
 
 	rows, err := s.db.QueryContext(ctx, q)
@@ -112,9 +135,9 @@ FROM tasks ORDER BY created_at DESC`
 // GetTask 按 ID 查询单个任务，不存在时返回 nil, nil（非错误）
 func (s *Store) GetTask(ctx context.Context, id string) (*TaskRow, error) {
 	const q = `
-SELECT id, kind, chat_id, chat_title, status, created_at, started_at, finished_at,
-       error, total, downloaded, failed, skipped, total_size, downloaded_size, expected_total,
-       scan_cursor, attempts, filters, message_id
+	SELECT id, kind, chat_id, chat_title, status, created_at, started_at, finished_at,
+	       error, total, downloaded, failed, skipped, total_size, downloaded_size, expected_total,
+	       scan_cursor, attempts, filters, message_id, stop_at_message_id, schedule_id, retry_failed_only
 FROM tasks WHERE id = ?`
 
 	row := s.db.QueryRowContext(ctx, q, id)
@@ -135,12 +158,14 @@ func scanTaskRow(row scanner) (*TaskRow, error) {
 		createdAt                  int64
 		startedAt, finishedAt      sql.NullInt64
 		errMsg, chatTitle, filters sql.NullString
+		scheduleID                 sql.NullString
 	)
 
 	if err := row.Scan(
 		&t.ID, &t.Kind, &t.ChatID, &chatTitle, &t.Status, &createdAt, &startedAt, &finishedAt,
 		&errMsg, &t.Total, &t.Downloaded, &t.Failed, &t.Skipped, &t.TotalSize, &t.DownloadedSize,
-		&t.ExpectedTotal, &t.ScanCursor, &t.Attempts, &filters, &t.MessageID,
+		&t.ExpectedTotal, &t.ScanCursor, &t.Attempts, &filters, &t.MessageID, &t.StopAtMessageID,
+		&scheduleID, &t.RetryFailedOnly,
 	); err != nil {
 		return nil, err
 	}
@@ -148,6 +173,7 @@ func scanTaskRow(row scanner) (*TaskRow, error) {
 	t.ChatTitle = chatTitle.String
 	t.Error = errMsg.String
 	t.Filters = filters.String
+	t.ScheduleID = scheduleID.String
 	t.CreatedAt = unixToTime(createdAt)
 	t.StartedAt = nullInt64ToTimePtr(startedAt)
 	t.FinishedAt = nullInt64ToTimePtr(finishedAt)

@@ -27,22 +27,17 @@ const (
 	defaultMaxConcurrent = 1
 )
 
-// 媒体类型分类目录名
 const (
-	mediaTypePhoto     = "photo"
-	mediaTypeDocument  = "document"
-	mediaTypeVideo     = "video"
-	mediaTypeAnimation = "animation"
-	mediaTypeAudio     = "audio"
-	mediaTypeVoice     = "voice"
-	mediaTypeOther     = "other"
-
 	// 进度状态（MediaProgress.Status）：与 RecordStatus 语义不同，独立成组
 	progressPaused      = "paused"
 	progressDownloading = "downloading"
 
-	// metadataFilePerm 是元数据 sidecar 的文件权限（非敏感内容）
-	metadataFilePerm = 0o644
+	// metadataFilePerm 限制 sidecar 仅当前用户可读；其中含 caption、发送者与聊天 ID。
+	metadataFilePerm = 0o600
+
+	// thumbsDirName 是缩略图缓存目录（位于下载根目录下）。
+	// 以点开头，与 .tdlib-files 一样不会混进用户的媒体目录里。
+	thumbsDirName = ".thumbs"
 )
 
 // MediaInfo 媒体文件信息
@@ -60,14 +55,29 @@ type MediaInfo struct {
 	AlbumID   int64  // Telegram 相册（media_album_id），0 = 不属于相册
 	Caption   string // 消息 caption 文本（供元数据 sidecar）
 	SenderID  int64  // 发送者 user/chat id（供元数据 sidecar）
+	ChatTitle string // 聊天标题（供路径模板的 {chat_title}），可为空
+
+	// Minithumb 是 TDLib 随消息免费返回的极小 JPEG（约 40x40、几百字节），
+	// 不需要任何额外下载。画廊用它做即时占位图。
+	Minithumb []byte
+	// ThumbFileID 是缩略图的 TDLib 文件 id（0 = 该媒体没有缩略图）。
+	// 缩略图是独立的小文件，需单独下载一次。
+	ThumbFileID int32
+	// ThumbUniqueID 是缩略图的 remote unique_id，用作 .thumbs/ 下的缓存文件名
+	ThumbUniqueID string
 }
 
 // RecordStatus 下载记录状态
 type RecordStatus string
 
 const (
-	// RecordStarted 表示开始下载
-	RecordStarted RecordStatus = "downloading"
+	// RecordQueued 表示媒体已进入下载流水线（尚未必然开始传输）。
+	//
+	// 取值是 "queued" 而非 "downloading"：事件在抢占下载槽位之前发出，而在途媒体上限
+	// （partition_size，默认 100）远大于下载并发（max_concurrent，默认 5），因此写
+	// "downloading" 会让库里出现上百行"下载中"而实际只有 5 个在传输。真正的传输态由内存
+	// 进度（MediaProgress）表达，不落库——落库的两次写入仍是"入队"与"终态"，写放大不变。
+	RecordQueued RecordStatus = "queued"
 	// RecordCompleted 表示下载完成
 	RecordCompleted RecordStatus = "completed"
 	// RecordFailed 表示下载失败
@@ -82,20 +92,24 @@ type RecordEvent struct {
 	Status         RecordStatus
 	FilePath       string
 	Reason         string
-	DownloadedSize int64 // 实际下载字节数（RecordCompleted 时填充，用于精确统计；0 表示未知）
+	DownloadedSize int64  // 实际下载字节数（RecordCompleted 时填充，用于精确统计；0 表示未知）
+	ThumbPath      string // 缩略图缓存路径（RecordCompleted 时填充；无缩略图为空）
 }
 
 // Downloader 下载器
 type Downloader struct {
-	downloadPath   string
-	logger         *logger.Logger
-	limiter        *concurrencyLimiter
-	stats          *DownloadStats
-	downloadFunc   func(context.Context, *MediaInfo, string) error
-	pauseFunc      func(context.Context, *MediaInfo) error
-	classifyByType atomic.Bool // Web 端可运行时切换，下载 goroutine 并发读取
-	saveMetadata   atomic.Bool // 下载完成后是否写元数据 sidecar
-	recordFunc     func(context.Context, RecordEvent)
+	downloadPath string
+	logger       *logger.Logger
+	limiter      *concurrencyLimiter
+	stats        *DownloadStats
+	downloadFunc func(context.Context, *MediaInfo, string) error
+	pauseFunc    func(context.Context, *MediaInfo) error
+	// thumbFunc 下载缩略图文件（与主文件下载分开：缩略图失败无关紧要，不进进度表、不重试）
+	thumbFunc      func(ctx context.Context, fileID int32, destPath string) error
+	classifyByType atomic.Bool  // Web 端可运行时切换，下载 goroutine 并发读取
+	saveMetadata   atomic.Bool  // 下载完成后是否写元数据 sidecar
+	pathTpl        atomic.Value // 落盘路径模板（string），空 = DefaultPathTemplate
+	recordFunc     func(context.Context, *RecordEvent)
 	// duplicateLookupFunc 按 unique_id 查找已完成下载的既有文件路径（内容级去重），可为 nil
 	duplicateLookupFunc func(context.Context, string) (string, bool)
 
@@ -110,6 +124,11 @@ type Downloader struct {
 	rateLast    map[int32]int64 // TDLib file id -> 上次观测的已下载字节数（按文件去重，避免多键扇出重复计数）
 	rateCum     int64           // 累计观测下载字节
 	rateSamples []rateSample    // (时刻, 累计字节) 采样，按时间递增
+
+	// 同一路径只能有一个写入者；同一 TDLib file id 也只能有一个传输请求。
+	// 这同时封住“检查存在后并发 rename”与共享 TDLib 缓存文件互相搬走的竞态。
+	targetGate *keyedGate[string]
+	fileGate   *keyedGate[int32]
 }
 
 type rateSample struct {
@@ -157,6 +176,8 @@ func New(downloadPath string, maxConcurrent int, logger *logger.Logger) *Downloa
 		progressKeyByFile: make(map[int32]map[string]struct{}),
 		controls:          make(map[string]*mediaControl),
 		rateLast:          make(map[int32]int64),
+		targetGate:        newKeyedGate[string](),
+		fileGate:          newKeyedGate[int32](),
 	}
 }
 
@@ -242,6 +263,16 @@ func (d *Downloader) SetPauseFunc(fn func(context.Context, *MediaInfo) error) {
 	d.pauseFunc = fn
 }
 
+// SetThumbDownloadFunc 设置缩略图下载函数（可为 nil = 不下载缩略图）
+func (d *Downloader) SetThumbDownloadFunc(fn func(ctx context.Context, fileID int32, destPath string) error) {
+	d.thumbFunc = fn
+}
+
+// ThumbsDir 返回缩略图缓存目录
+func (d *Downloader) ThumbsDir() string {
+	return filepath.Join(d.downloadPath, thumbsDirName)
+}
+
 // SetClassifyByType 设置是否按媒体类型分类存储
 func (d *Downloader) SetClassifyByType(v bool) {
 	d.classifyByType.Store(v)
@@ -253,7 +284,7 @@ func (d *Downloader) ClassifyByType() bool {
 }
 
 // SetRecordFunc 设置下载历史记录回调
-func (d *Downloader) SetRecordFunc(fn func(context.Context, RecordEvent)) {
+func (d *Downloader) SetRecordFunc(fn func(context.Context, *RecordEvent)) {
 	d.recordFunc = fn
 }
 
@@ -286,21 +317,11 @@ func (d *Downloader) ActiveCount() int {
 }
 
 // record 触发下载历史记录回调，未设置时无操作
-func (d *Downloader) record(ctx context.Context, evt RecordEvent) {
+func (d *Downloader) record(ctx context.Context, evt *RecordEvent) {
 	if d.recordFunc == nil {
 		return
 	}
 	d.recordFunc(ctx, evt)
-}
-
-// classifyDir 根据媒体类型返回分类子目录名
-func classifyDir(mediaType string) string {
-	switch mediaType {
-	case mediaTypePhoto, mediaTypeDocument, mediaTypeVideo, mediaTypeAnimation, mediaTypeAudio, mediaTypeVoice:
-		return mediaType
-	default:
-		return mediaTypeOther
-	}
 }
 
 // Stats 是下载统计的只读快照（无锁，便于 JSON 序列化）
@@ -330,6 +351,53 @@ type MediaProgress struct {
 	FilePath       string    `json:"file_path,omitempty"`
 	StartedAt      time.Time `json:"started_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+	// SpeedBps 是该文件的实时下载速度（字节/秒）。此前只有全局聚合速度，
+	// 单个文件卡住时用户看不出是哪一个在拖后腿。
+	SpeedBps int64 `json:"speed_bps"`
+	// ETASeconds 是该文件的预计剩余秒数（速度未知或已完成时为 0）
+	ETASeconds int64 `json:"eta_seconds,omitempty"`
+
+	// 速度平滑用的内部状态（不序列化）
+	lastBytes int64
+	lastAt    time.Time
+}
+
+const (
+	// speedEMAWeight 是新观测值在指数滑动平均中的权重（越大越灵敏、越抖动）
+	speedEMAWeight = 0.3
+	// speedMinInterval 是两次速度采样的最小间隔，避免过密采样把噪声放大
+	speedMinInterval = 300 * time.Millisecond
+)
+
+// updateSpeed 按本次观测刷新单文件的速度与剩余时间（调用方持 progressMu 写锁）
+func (p *MediaProgress) updateSpeed(downloaded int64, now time.Time) {
+	if p.lastAt.IsZero() {
+		p.lastBytes, p.lastAt = downloaded, now
+		return
+	}
+	elapsed := now.Sub(p.lastAt)
+	if elapsed < speedMinInterval {
+		return
+	}
+
+	delta := downloaded - p.lastBytes
+	p.lastBytes, p.lastAt = downloaded, now
+	if delta < 0 {
+		return // TDLib 重置了该文件的进度（例如恢复下载），本次不计
+	}
+
+	instant := float64(delta) / elapsed.Seconds()
+	if p.SpeedBps == 0 {
+		p.SpeedBps = int64(instant)
+	} else {
+		p.SpeedBps = int64(speedEMAWeight*instant + (1-speedEMAWeight)*float64(p.SpeedBps))
+	}
+
+	if p.SpeedBps > 0 && p.FileSize > downloaded {
+		p.ETASeconds = (p.FileSize - downloaded) / p.SpeedBps
+	} else {
+		p.ETASeconds = 0
+	}
 }
 
 // Snapshot 返回当前下载统计的只读快照
@@ -389,10 +457,14 @@ func (d *Downloader) UpdateProgress(tdFileID int32, downloaded, total int64, com
 				p.Percent = 100
 			}
 		}
+		if downloaded >= 0 {
+			p.updateSpeed(downloaded, now)
+		}
 		if completed {
 			p.Status = "completed"
 			p.Paused = false
 			p.Percent = 100
+			p.ETASeconds = 0
 			if p.FileSize > 0 {
 				p.DownloadedSize = p.FileSize
 			}
@@ -534,7 +606,7 @@ func (d *Downloader) finishProgress(key string, media *MediaInfo, status string)
 func (d *Downloader) finishCanceled(ctx context.Context, key string, media *MediaInfo, filePath string) {
 	d.finishProgress(key, media, "canceled")
 	d.updateStats(false, 0)
-	d.record(ctx, RecordEvent{Media: media, Status: RecordFailed, FilePath: filePath, Reason: "下载已取消"})
+	d.record(ctx, &RecordEvent{Media: media, Status: RecordFailed, FilePath: filePath, Reason: "下载已取消"})
 }
 
 func mediaProgressKey(media *MediaInfo) string {
@@ -732,25 +804,48 @@ func (d *Downloader) updateStats(downloaded bool, size int64) {
 	}
 }
 
-// DownloadMedia 下载媒体文件
+// DownloadMedia 下载媒体文件。
+//
+// 事件契约：每个媒体恰好发出一次 RecordQueued，随后恰好发出一次终态事件
+// （Completed/Failed/Skipped）。任务统计据此保持 Total = Downloaded + Failed + Skipped。
 func (d *Downloader) DownloadMedia(ctx context.Context, media *MediaInfo) error {
-	filePath, done, err := d.prepareMediaTarget(ctx, media)
-	if done || err != nil {
+	chatDir, fileName, filePath := d.planMediaPath(media)
+	media.FileName = fileName
+
+	// 入队事件先行，保证后续任何分支（含失败）都已有对应的 history 行
+	d.record(ctx, &RecordEvent{Media: media, Status: RecordQueued, FilePath: filePath})
+
+	// 路径规划与存在性检查本身不足以防并发覆盖：两个 goroutine 可能同时看见
+	// “不存在”后一起下载并 rename。相同最终路径必须从检查到终态全程串行。
+	releaseTarget, err := d.targetGate.acquire(ctx, filepath.Clean(filePath))
+	if err != nil {
+		d.failMedia(ctx, media, filePath, err.Error())
+		return err
+	}
+	defer releaseTarget()
+
+	if err := d.ensureTargetDir(ctx, media, chatDir, filePath); err != nil {
 		return err
 	}
 
+	// 已下载过且文件完好 → 跳过
+	if d.skipIfComplete(ctx, media, filePath) {
+		return nil
+	}
+
 	if d.downloadFunc == nil {
-		d.updateStats(false, 0)
-		d.record(ctx, RecordEvent{Media: media, Status: RecordStarted, FilePath: filePath})
-		d.record(ctx, RecordEvent{Media: media, Status: RecordFailed, FilePath: filePath, Reason: "下载函数未设置"})
+		d.failMedia(ctx, media, filePath, "下载函数未设置")
 		return fmt.Errorf("下载函数未设置")
 	}
 
 	progressKey := d.startProgress(media, filePath)
-	d.record(ctx, RecordEvent{Media: media, Status: RecordStarted, FilePath: filePath})
 
-	if err := d.downloadWithPauseLoop(ctx, media, filePath, progressKey); err != nil {
+	deduped, err := d.downloadWithPauseLoop(ctx, media, filePath, progressKey)
+	if err != nil {
 		return err
+	}
+	if deduped {
+		return nil // 已由去重复制完成，跳过事件在 copyFromDuplicate 中记录
 	}
 
 	actual := d.downloadedBytes(progressKey)
@@ -760,49 +855,148 @@ func (d *Downloader) DownloadMedia(ctx context.Context, media *MediaInfo) error 
 	d.logger.Info("下载完成: %s", media.FileName)
 	d.updateStats(true, actual)
 	d.finishProgress(progressKey, media, "completed")
-	d.record(ctx, RecordEvent{Media: media, Status: RecordCompleted, FilePath: filePath, DownloadedSize: actual})
+	d.record(ctx, &RecordEvent{
+		Media:          media,
+		Status:         RecordCompleted,
+		FilePath:       filePath,
+		DownloadedSize: actual,
+		ThumbPath:      d.fetchThumb(ctx, media),
+	})
 	d.writeMetadataSidecar(media, filePath)
 	return nil
 }
 
-// prepareMediaTarget 规划目标路径并执行下载前检查（路径安全/建目录/已存在跳过/内容级去重）。
-// done=true 表示无需下载（已跳过或已复制），err 非空表示前置失败（已记录事件）。
-func (d *Downloader) prepareMediaTarget(ctx context.Context, media *MediaInfo) (filePath string, done bool, err error) {
-	chatDir, fileName, filePath := d.planMediaPath(media)
-	media.FileName = fileName
+// fetchThumb 下载媒体的缩略图到 .thumbs/ 缓存，返回其路径（失败或无缩略图时返回空串）。
+//
+// 全程 best-effort：缩略图只是画廊的加速件，它失败不该影响主文件的下载结果。
+// 按 unique_id 命名，因此同一文件被转发到多个聊天时只下一次。
+func (d *Downloader) fetchThumb(ctx context.Context, media *MediaInfo) string {
+	if d.thumbFunc == nil || media.ThumbFileID == 0 || media.ThumbUniqueID == "" {
+		return ""
+	}
+	dir := filepath.Join(d.downloadPath, thumbsDirName)
+	path := filepath.Join(dir, media.ThumbUniqueID+".jpg")
 
-	// 先做路径安全校验，再创建目录：文件名来自远端消息，
-	// 必须在任何 MkdirAll 之前确认其位于下载根目录内，避免在校验前于任意可写路径建目录。
+	if err := rejectSymlinkPath(d.downloadPath, path); err != nil {
+		d.logger.Debug("缩略图路径包含符号链接，已跳过: %v", err)
+		return ""
+	}
+	if st, err := os.Lstat(path); err == nil && st.Mode().IsRegular() && st.Size() > 0 {
+		return path // 已缓存（同一文件转发到多个聊天）
+	}
+	if err := os.MkdirAll(dir, DirectoryPermission); err != nil {
+		d.logger.Debug("创建缩略图目录失败: %v", err)
+		return ""
+	}
+	if err := rejectSymlinkPath(d.downloadPath, path); err != nil {
+		d.logger.Debug("缩略图路径包含符号链接，已跳过: %v", err)
+		return ""
+	}
+	if err := d.thumbFunc(ctx, media.ThumbFileID, path); err != nil {
+		d.logger.Debug("下载缩略图失败（不影响主文件）: %v", err)
+		return ""
+	}
+	return path
+}
+
+// ensureTargetDir 校验路径安全并创建目标目录。
+// 先校验后建目录：文件名来自远端消息，必须在任何 MkdirAll 之前确认其位于下载根目录内，
+// 避免在校验前于任意可写路径建目录。
+func (d *Downloader) ensureTargetDir(ctx context.Context, media *MediaInfo, chatDir, filePath string) error {
 	if !d.isSafePath(chatDir, d.downloadPath) || !d.isSafePath(filePath, d.downloadPath) {
 		d.logger.Error("不安全的文件路径: %s", filePath)
-		d.updateStats(false, 0)
 		err := fmt.Errorf("unsafe file path: %s", filePath)
-		d.record(ctx, RecordEvent{Media: media, Status: RecordStarted, FilePath: filePath})
-		d.record(ctx, RecordEvent{Media: media, Status: RecordFailed, FilePath: filePath, Reason: err.Error()})
-		return filePath, false, err
+		d.failMedia(ctx, media, filePath, err.Error())
+		return err
 	}
-
+	if err := rejectSymlinkPath(d.downloadPath, filePath); err != nil {
+		d.logger.Error("下载路径包含符号链接: %v", err)
+		d.failMedia(ctx, media, filePath, err.Error())
+		return err
+	}
 	if err := os.MkdirAll(chatDir, DirectoryPermission); err != nil {
 		d.logger.Error("创建目录失败: %v", err)
-		d.updateStats(false, 0)
-		d.record(ctx, RecordEvent{Media: media, Status: RecordStarted, FilePath: chatDir})
-		d.record(ctx, RecordEvent{Media: media, Status: RecordFailed, FilePath: chatDir, Reason: err.Error()})
-		return filePath, false, err
+		d.failMedia(ctx, media, chatDir, err.Error())
+		return err
+	}
+	// MkdirAll 与首次检查之间目录可能发生变化，再检查一次现有的完整路径。
+	if err := rejectSymlinkPath(d.downloadPath, filePath); err != nil {
+		d.logger.Error("下载路径包含符号链接: %v", err)
+		d.failMedia(ctx, media, filePath, err.Error())
+		return err
+	}
+	return nil
+}
+
+// rejectSymlinkPath 检查 base 下从第一层目录到 target 的每个已存在路径段。
+// 远端名称本身不能创建符号链接，但应用不应跟随下载目录里预先放置的链接写到根目录之外。
+func rejectSymlinkPath(base, target string) error {
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return err
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(absBase, absTarget)
+	if err != nil {
+		return err
+	}
+	if rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("路径位于下载根目录之外: %s", target)
+	}
+	if rel == "." {
+		return nil
 	}
 
-	// 检查文件是否已存在
-	if _, err := os.Stat(filePath); err == nil {
-		d.logger.Debug("文件已存在，跳过下载: %s", fileName)
-		d.recordSkip(ctx, media, filePath, "")
-		return filePath, true, nil
+	current := absBase
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i, part := range parts {
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if os.IsNotExist(statErr) {
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("路径段是符号链接: %s", current)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return fmt.Errorf("路径段不是目录: %s", current)
+		}
 	}
+	return nil
+}
 
-	// 内容级去重：同一 unique_id 已在别处下载完成且源文件仍在，复制而非重新下载；
-	// 源文件已被删除时照常下载（跳过会在用户清理旧文件后静默丢失内容）
-	if d.copyFromDuplicate(ctx, media, filePath) {
-		return filePath, true, nil
+// failMedia 记一次失败（统计 + 终态事件）
+func (d *Downloader) failMedia(ctx context.Context, media *MediaInfo, filePath, reason string) {
+	d.updateStats(false, 0)
+	d.record(ctx, &RecordEvent{Media: media, Status: RecordFailed, FilePath: filePath, Reason: reason})
+}
+
+// skipIfComplete 判断目标文件是否已存在且完好，是则记跳过并返回 true。
+//
+// 仅凭 os.Stat 存在就跳过是不够的：一个 0 字节或被截断的残留文件（旧版本、外部工具或
+// 手动操作留下的）会被永久跳过，用户永远拿不到这个文件。此处比对 TDLib 给出的期望大小。
+func (d *Downloader) skipIfComplete(ctx context.Context, media *MediaInfo, filePath string) bool {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return false
 	}
-	return filePath, false, nil
+	if info.IsDir() || info.Size() == 0 {
+		d.logger.Warn("已存在路径不是完整文件，重新下载: %s", media.FileName)
+		return false
+	}
+	if media.FileSize > 0 && info.Size() != media.FileSize {
+		d.logger.Warn("已存在文件大小不符（%d != %d），重新下载: %s", info.Size(), media.FileSize, media.FileName)
+		return false
+	}
+	d.logger.Debug("文件已存在，跳过下载: %s", media.FileName)
+	d.recordSkip(ctx, media, filePath, "")
+	return true
 }
 
 // recordSkip 统计并记录一次跳过事件
@@ -810,7 +1004,7 @@ func (d *Downloader) recordSkip(ctx context.Context, media *MediaInfo, filePath,
 	d.stats.mu.Lock()
 	d.stats.Skipped++
 	d.stats.mu.Unlock()
-	d.record(ctx, RecordEvent{Media: media, Status: RecordSkipped, FilePath: filePath, Reason: reason})
+	d.record(ctx, &RecordEvent{Media: media, Status: RecordSkipped, FilePath: filePath, Reason: reason})
 }
 
 // copyFromDuplicate 尝试按 unique_id 从既有文件复制；成功返回 true（已记 skipped）
@@ -822,10 +1016,17 @@ func (d *Downloader) copyFromDuplicate(ctx context.Context, media *MediaInfo, fi
 	if !ok || src == "" || src == filePath {
 		return false
 	}
-	if _, err := os.Stat(src); err != nil {
+	info, err := os.Stat(src)
+	if err != nil {
 		return false // 源文件已删，照常下载
 	}
-	if err := copyFile(src, filePath); err != nil {
+	// unique_id 只能证明 Telegram 端内容相同，不能证明本地源文件仍完好。
+	// 期望大小未知时也无法完成校验，宁可重新下载，不能复制一个可能损坏的文件并记成功。
+	if info.IsDir() || media.FileSize <= 0 || info.Size() != media.FileSize {
+		d.logger.Warn("去重源大小无法验证或不匹配，回退为正常下载: %s", src)
+		return false
+	}
+	if err := linkOrCopy(src, filePath); err != nil {
 		d.logger.Warn("去重复制失败，回退为正常下载: %v", err)
 		return false
 	}
@@ -834,31 +1035,76 @@ func (d *Downloader) copyFromDuplicate(ctx context.Context, media *MediaInfo, fi
 	return true
 }
 
-// downloadWithPauseLoop 执行带暂停/恢复语义的下载循环，直至成功、失败或取消
-func (d *Downloader) downloadWithPauseLoop(ctx context.Context, media *MediaInfo, filePath, progressKey string) error {
+// linkOrCopy 优先建硬链接，失败（跨文件系统、不支持硬链接、目标已存在）时回退为整文件复制。
+//
+// 硬链接让同一份内容在多个聊天/相册目录下只占一份磁盘空间——转发到 10 个群的同一个视频
+// 此前会被实实在在地复制 10 份。
+func linkOrCopy(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	return copyFile(src, dst)
+}
+
+// downloadWithPauseLoop 执行带暂停/恢复语义的下载循环，直至成功、失败或取消。
+// deduped 为真表示文件由内容级去重复制完成，未经过实际下载（终态事件已记录）。
+func (d *Downloader) downloadWithPauseLoop(
+	ctx context.Context, media *MediaInfo, filePath, progressKey string,
+) (deduped bool, err error) {
 	for {
 		if err := d.waitUntilResumed(ctx, progressKey); err != nil {
 			d.finishCanceled(ctx, progressKey, media, filePath)
-			return err
+			return false, err
+		}
+
+		// TDLib 的下载与取消都按 file_id 操作。相同 file_id 若同时进入两个任务，
+		// 会共享缓存路径并互相取消，因此每次真实尝试必须按 file_id 串行。
+		releaseFile := func() {}
+		if media.TDFileID != 0 {
+			var err error
+			releaseFile, err = d.fileGate.acquire(ctx, media.TDFileID)
+			if err != nil {
+				d.finishCanceled(ctx, progressKey, media, filePath)
+				return false, err
+			}
+		}
+		if d.isMediaPaused(progressKey) {
+			releaseFile()
+			d.markProgressStatus(progressKey, progressPaused)
+			continue
 		}
 		if err := d.limiter.acquire(ctx); err != nil {
+			releaseFile()
 			d.finishCanceled(ctx, progressKey, media, filePath)
-			return err
+			return false, err
 		}
 		// acquire 可能阻塞较久，其间可能收到 PauseMedia；重新检查暂停状态，
 		// 若已暂停则释放槽位回到循环等待恢复，避免暂停被 "downloading" 覆盖后静默下载完成。
 		if d.isMediaPaused(progressKey) {
 			d.limiter.release()
+			releaseFile()
 			d.markProgressStatus(progressKey, progressPaused)
 			continue
 		}
+
+		// 内容级去重在持槽之后执行：它要查一次库、还可能整文件复制，都是实打实的 IO。
+		// 放在槽外时，在途上限（partition_size，默认 100）会让上百个 goroutine 同时做
+		// 全文件复制并争抢 4 条 SQLite 连接，而 max_concurrent（默认 5）完全管不到它们。
+		if d.copyFromDuplicate(ctx, media, filePath) {
+			d.limiter.release()
+			releaseFile()
+			d.finishProgress(progressKey, media, "skipped")
+			return true, nil
+		}
+
 		d.markProgressStatus(progressKey, progressDownloading)
 		d.beginAttempt(progressKey)
 		d.logger.Info("开始下载: %s (大小: %d bytes)", media.FileName, media.FileSize)
-		err := d.downloadFunc(ctx, media, filePath)
+		dlErr := d.downloadFunc(ctx, media, filePath)
 		d.limiter.release()
-		if err == nil {
-			return nil
+		releaseFile()
+		if dlErr == nil {
+			return false, nil
 		}
 		// 暂停诱发的取消不算失败：用 pauseRequestedSince 判定（而非当前 paused 状态），
 		// 以覆盖“暂停后立即恢复”导致 paused 已被清除、错误却仍是暂停取消的竞态。
@@ -867,12 +1113,26 @@ func (d *Downloader) downloadWithPauseLoop(ctx context.Context, media *MediaInfo
 			d.markProgressStatus(progressKey, progressPaused)
 			continue
 		}
-		d.logger.Error("下载失败 %s: %v", media.FileName, err)
+		d.logger.Error("下载失败 %s: %v", media.FileName, dlErr)
 		d.updateStats(false, 0)
 		d.finishProgress(progressKey, media, "failed")
-		d.record(ctx, RecordEvent{Media: media, Status: RecordFailed, FilePath: filePath, Reason: err.Error()})
-		return err
+		d.record(ctx, &RecordEvent{Media: media, Status: RecordFailed, FilePath: filePath, Reason: dlErr.Error()})
+		return false, dlErr
 	}
+}
+
+// mediaSidecar 是 <文件>.json 元数据的载荷结构
+type mediaSidecar struct {
+	MessageID int64  `json:"message_id"`
+	ChatID    int64  `json:"chat_id"`
+	Date      int64  `json:"date"`
+	SenderID  int64  `json:"sender_id"`
+	Caption   string `json:"caption"`
+	AlbumID   int64  `json:"album_id"`
+	MediaType string `json:"media_type"`
+	FileName  string `json:"file_name"`
+	FileSize  int64  `json:"file_size"`
+	MimeType  string `json:"mime_type"`
 }
 
 // writeMetadataSidecar 在开关开启时写 <文件>.json 元数据（best-effort，失败仅告警）
@@ -880,26 +1140,58 @@ func (d *Downloader) writeMetadataSidecar(media *MediaInfo, filePath string) {
 	if !d.saveMetadata.Load() {
 		return
 	}
-	payload := map[string]any{
-		"message_id": media.MessageID,
-		"chat_id":    media.ChatID,
-		"date":       media.Date.Unix(),
-		"sender_id":  media.SenderID,
-		"caption":    media.Caption,
-		"album_id":   media.AlbumID,
-		"media_type": media.MediaType,
-		"file_name":  media.FileName,
-		"file_size":  media.FileSize,
-		"mime_type":  media.MimeType,
+	payload := mediaSidecar{
+		MessageID: media.MessageID,
+		ChatID:    media.ChatID,
+		Date:      media.Date.Unix(),
+		SenderID:  media.SenderID,
+		Caption:   media.Caption,
+		AlbumID:   media.AlbumID,
+		MediaType: media.MediaType,
+		FileName:  media.FileName,
+		FileSize:  media.FileSize,
+		MimeType:  media.MimeType,
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		d.logger.Warn("序列化元数据失败: %v", err)
 		return
 	}
-	if err := os.WriteFile(filePath+".json", data, metadataFilePerm); err != nil { // #nosec G306 -- 元数据非敏感
+	if err := writeFileAtomic(filePath+".json", data, metadataFilePerm); err != nil {
 		d.logger.Warn("写入元数据 sidecar 失败: %v", err)
 	}
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".metadata-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	remove := true
+	defer func() {
+		_ = tmp.Close()
+		if remove {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	remove = false
+	return nil
 }
 
 // copyFile 将 src 复制为 dst：先写入同目录临时文件再原子 rename，
@@ -917,6 +1209,11 @@ func copyFile(src, dst string) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := io.Copy(tmp, in); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
 		return err
@@ -942,46 +1239,52 @@ func (d *Downloader) downloadedBytes(key string) int64 {
 	return 0
 }
 
+// planMediaPath 按路径模板算出媒体的落盘目录与完整路径。
+//
+// 越界兜底：模板由用户配置，展开的值又来自 Telegram（文件名、聊天标题都是他人可控的），
+// 因此结果必须落回下载根目录之内，否则拒绝该模板结果、退回默认布局。
 func (d *Downloader) planMediaPath(media *MediaInfo) (chatDir, fileName, filePath string) {
-	chatDir = filepath.Join(d.downloadPath, fmt.Sprintf("chat_%d", media.ChatID))
-	if d.classifyByType.Load() {
-		chatDir = filepath.Join(chatDir, classifyDir(media.MediaType))
-	}
-	if media.AlbumID != 0 {
-		// 同一相册的文件归入同一子目录
-		chatDir = filepath.Join(chatDir, fmt.Sprintf("album_%d", media.AlbumID))
+	ctx := pathContext{media: media, classifyByType: d.classifyByType.Load()}
+
+	rel := expandPathTemplate(d.pathTemplate(), ctx)
+	filePath = filepath.Join(d.downloadPath, rel)
+	if !d.isSafePath(filePath, d.downloadPath) {
+		rel = expandPathTemplate(DefaultPathTemplate, ctx)
+		filePath = filepath.Join(d.downloadPath, rel)
 	}
 
-	fileName = media.FileName
-	if fileName == "" {
-		ext := d.getFileExtension(media.MimeType)
-		fileName = fmt.Sprintf("file_%d_%d%s", media.MessageID, media.TDFileID, ext)
-	}
-	fileName = d.sanitizeFileName(fileName)
-	filePath = filepath.Join(chatDir, fileName)
+	chatDir = filepath.Dir(filePath)
+	fileName = filepath.Base(filePath)
 	return chatDir, fileName, filePath
 }
 
-// sanitizeFileName 清理文件名，移除危险字符
-func (d *Downloader) sanitizeFileName(fileName string) string {
-	// 移除路径分隔符和其他危险字符
-	fileName = strings.ReplaceAll(fileName, "/", "_")
-	fileName = strings.ReplaceAll(fileName, "\\", "_")
-	fileName = strings.ReplaceAll(fileName, "..", "_")
-	fileName = strings.ReplaceAll(fileName, ":", "_")
-	fileName = strings.ReplaceAll(fileName, "*", "_")
-	fileName = strings.ReplaceAll(fileName, "?", "_")
-	fileName = strings.ReplaceAll(fileName, "\"", "_")
-	fileName = strings.ReplaceAll(fileName, "<", "_")
-	fileName = strings.ReplaceAll(fileName, ">", "_")
-	fileName = strings.ReplaceAll(fileName, "|", "_")
+// TargetPath 返回该媒体按当前模板应落盘的完整路径（不触发下载）。
+// 供导出功能定位已下载的文件。
+func (d *Downloader) TargetPath(media *MediaInfo) string {
+	_, _, filePath := d.planMediaPath(media)
+	return filePath
+}
 
-	// 确保文件名不为空
-	if fileName == "" || fileName == "." || fileName == ".." {
-		fileName = "unnamed_file"
+// DownloadPath 返回下载根目录
+func (d *Downloader) DownloadPath() string { return d.downloadPath }
+
+// pathTemplate 返回当前生效的路径模板（未配置时为默认布局）
+func (d *Downloader) pathTemplate() string {
+	tpl, _ := d.pathTpl.Load().(string)
+	if tpl == "" {
+		return DefaultPathTemplate
 	}
+	return tpl
+}
 
-	return fileName
+// SetPathTemplate 设置落盘路径模板；非法模板被忽略并退回默认布局，
+// 避免一个手滑的配置把所有文件写到下载根目录之外
+func (d *Downloader) SetPathTemplate(tpl string) {
+	if tpl == "" || ValidatePathTemplate(tpl) != "" {
+		d.pathTpl.Store(DefaultPathTemplate)
+		return
+	}
+	d.pathTpl.Store(tpl)
 }
 
 // isSafePath 验证文件路径是否安全（在指定的基础目录内）
@@ -1003,38 +1306,8 @@ func (d *Downloader) isSafePath(filePath, basePath string) bool {
 		return false
 	}
 
-	// 如果相对路径包含".."，说明试图访问基础目录外的文件
-	return !strings.HasPrefix(relPath, "..") && !strings.Contains(relPath, "/..")
-}
-
-// getFileExtension 根据MIME类型获取文件扩展名
-func (d *Downloader) getFileExtension(mimeType string) string {
-	switch mimeType {
-	case "image/jpeg":
-		return ".jpg"
-	case "image/png":
-		return ".png"
-	case "image/gif":
-		return ".gif"
-	case "image/webp":
-		return ".webp"
-	case "video/mp4":
-		return ".mp4"
-	case "video/avi":
-		return ".avi"
-	case "video/mov":
-		return ".mov"
-	case "video/webm":
-		return ".webm"
-	case "audio/mp3":
-		return ".mp3"
-	case "audio/ogg":
-		return ".ogg"
-	case "application/pdf":
-		return ".pdf"
-	default:
-		return ""
-	}
+	return relPath != ".." && !filepath.IsAbs(relPath) &&
+		!strings.HasPrefix(relPath, ".."+string(filepath.Separator))
 }
 
 // DownloadSingle 下载单个媒体文件（用于实时监控）

@@ -5,15 +5,18 @@ package web
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"tg-down/internal/config"
 	"tg-down/internal/downloader"
@@ -21,11 +24,37 @@ import (
 	"tg-down/internal/notify"
 	"tg-down/internal/queue"
 	"tg-down/internal/store"
-	"tg-down/internal/telegram"
+	"tg-down/internal/tgapi"
 )
 
-//go:embed static/index.html
-var indexHTML []byte
+// distFS 是 Vite 的构建产物（web/ 目录经 `make web` 生成）。
+//
+// all: 前缀不可省：Vite 的产物在 assets/ 子目录里，而 go:embed 默认跳过以 _ 或 . 开头的文件，
+// 且不带 all: 时不会递归进子目录中的此类文件。
+//
+// 仓库里提交了 static/dist/.gitkeep，因此没跑过 npm build 也能编译（否则 embed 找不到目录，
+// 会直接把 lint / 依赖提交 / 发布这几个 CI 作业一起打断）。此时 uiFS 里没有 index.html，
+// handleIndex 会明确告诉用户去跑 `make web`，而不是白屏。
+//
+//go:embed all:static/dist
+var distFS embed.FS
+
+// uiFS 是以 static/dist 为根的前端资源
+var uiFS = mustSubFS(distFS, "static/dist")
+
+func mustSubFS(f embed.FS, dir string) fs.FS {
+	sub, err := fs.Sub(f, dir)
+	if err != nil {
+		panic("embed: " + err.Error()) // 构建期就该发现，不该留到运行时
+	}
+	return sub
+}
+
+// uiBuilt 报告前端产物是否真的在（而不是只有占位的 .gitkeep）
+func uiBuilt() bool {
+	_, err := fs.Stat(uiFS, "index.html")
+	return err == nil
+}
 
 const (
 	// DefaultAddr is the default listen address (localhost only).
@@ -37,10 +66,12 @@ const (
 	snapshotInterval      = time.Second
 	sseBufferSize         = 32
 	authChanSize          = 1
+	minWebTokenLength     = 16
 	phoneMaskKeepHead     = 3
 	phoneMaskKeepTail     = 2
 	initialReconnectDelay = 2 * time.Second
 	maxReconnectDelay     = 30 * time.Second
+	logoutTaskWaitTimeout = 30 * time.Second
 	reconnectFactor       = 2
 
 	// SSE 事件类型
@@ -65,24 +96,29 @@ const (
 
 // Server 是 Web 管理端
 type Server struct {
-	client       *telegram.Client
-	store        *store.Store
-	queue        *queue.Manager
-	logger       *logger.Logger
-	addr         string
-	token        string   // 访问令牌（TG_DOWN_WEB_TOKEN）；非本地监听时必需
-	allowedHosts []string // 额外放行的 Host 白名单
-	hub          *sseHub
-	baseCtx      context.Context // 下载任务的生命周期父上下文（在 Run 中设置）
+	client        tgapi.Client
+	store         *store.Store
+	queue         *queue.Manager
+	logger        *logger.Logger
+	addr          string
+	downloadRoot  string   // 下载根目录：媒体服务端点据此做越界校验
+	token         string   // 访问令牌（TG_DOWN_WEB_TOKEN）；非本地监听时必需
+	allowedHosts  []string // 额外放行的 Host 白名单
+	trustProxy    bool     // 是否信任反向代理提供的 X-Forwarded-Proto
+	hub           *sseHub
+	baseCtx       context.Context // 下载任务的生命周期父上下文（在 Run 中设置）
+	serveHTTP     func(*http.Server) error
+	queueDraining atomic.Bool
 
 	mu       sync.RWMutex
 	state    State
 	stateErr string
-	chats    []telegram.ChatInfo
+	chats    []tgapi.ChatInfo
 
 	codeCh   chan string
 	passCh   chan string
 	credCh   chan struct{} // Web 端提交 API 凭据的信号
+	credSlot chan struct{} // 限制同一认证轮次只能接收一次凭据更新
 	abortCh  chan struct{} // Web 端中止当前登录（验证码/密码步骤的"返回上一步"）
 	logoutCh chan struct{} // Web 端登出完成，通知 runTelegram 重新进入认证循环
 }
@@ -91,7 +127,7 @@ type Server struct {
 var errAuthAborted = errors.New("登录已被用户中止")
 
 // New 创建 Web 管理端：按配置构建任务队列管理器并接线完成通知
-func New(client *telegram.Client, st *store.Store, log *logger.Logger, addr string, cfg *config.Config) *Server {
+func New(client tgapi.Client, st *store.Store, log *logger.Logger, addr string, cfg *config.Config) *Server {
 	if addr == "" {
 		addr = DefaultAddr
 	}
@@ -109,13 +145,16 @@ func New(client *telegram.Client, st *store.Store, log *logger.Logger, addr stri
 		queue:        q,
 		logger:       log,
 		addr:         addr,
+		downloadRoot: cfg.Download.Path,
 		token:        os.Getenv(webTokenEnv),
 		allowedHosts: parseAllowedHosts(os.Getenv(allowedHostsEnv)),
+		trustProxy:   envEnabled(os.Getenv(trustProxyEnv)),
 		hub:          newSSEHub(),
 		state:        StateConnecting,
 		codeCh:       make(chan string, authChanSize),
 		passCh:       make(chan string, authChanSize),
 		credCh:       make(chan struct{}, authChanSize),
+		credSlot:     make(chan struct{}, authChanSize),
 		abortCh:      make(chan struct{}, authChanSize),
 		logoutCh:     make(chan struct{}, authChanSize),
 	}
@@ -123,18 +162,32 @@ func New(client *telegram.Client, st *store.Store, log *logger.Logger, addr stri
 
 // Run 启动后台 Telegram 连接与 HTTP 服务，阻塞直到 ctx 取消
 func (s *Server) Run(ctx context.Context) error {
-	s.baseCtx = ctx
+	tokenRequired := !isLoopbackAddr(s.addr) || len(s.allowedHosts) > 0 || s.trustProxy
+	if tokenRequired && s.token == "" {
+		return fmt.Errorf("监听非本地地址或配置代理 Host 时必须通过环境变量 %s 设置访问令牌，否则拒绝启动", webTokenEnv)
+	}
+	if tokenRequired && utf8.RuneCountInString(strings.TrimSpace(s.token)) < minWebTokenLength {
+		return fmt.Errorf("%s 至少需要 %d 个字符；请使用随机生成的高强度令牌", webTokenEnv, minWebTokenLength)
+	}
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	s.baseCtx = runCtx
 	s.logger.SetHook(s.onLog)
 	defer s.logger.SetHook(nil)
 
 	s.queue.SetOnChange(s.onTaskChange)
-	go s.runTelegram(ctx)
-	go s.snapshotLoop(ctx)
-	go s.queue.Run(ctx)
-
-	if !isLoopbackAddr(s.addr) && s.token == "" {
-		return fmt.Errorf("监听非本地地址 %s 时必须通过环境变量 %s 设置访问令牌，否则拒绝启动", s.addr, webTokenEnv)
+	var background sync.WaitGroup
+	startBackground := func(run func()) {
+		background.Add(1)
+		go func() {
+			defer background.Done()
+			run()
+		}()
 	}
+	startBackground(func() { s.runTelegram(runCtx) })
+	startBackground(func() { s.snapshotLoop(runCtx) })
+	startBackground(func() { s.queue.Run(runCtx) })
 
 	mux := http.NewServeMux()
 	s.routes(mux)
@@ -146,21 +199,28 @@ func (s *Server) Run(ctx context.Context) error {
 		// 不设置 WriteTimeout：SSE 事件流为长连接，写超时会中断推送。
 	}
 
-	go func() { //nolint:gosec // 父 ctx 已取消，关闭需独立超时窗口
-		<-ctx.Done()
+	startBackground(func() { //nolint:gosec // 父 ctx 已取消，关闭需独立超时窗口
+		<-runCtx.Done()
 		// 运行中任务的 ctx 派生自同一个 ctx，取消已沿调用链自动传播，
 		// 此处无需再显式遍历取消。
 		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
-	}()
+	})
 
 	if !isLoopbackAddr(s.addr) {
 		s.logger.Info("Web 端监听非本地地址 %s，已启用访问令牌鉴权", s.addr)
 	}
 	s.logger.Info("Web 管理端已启动: http://%s", s.addr)
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	serve := s.serveHTTP
+	if serve == nil {
+		serve = func(server *http.Server) error { return server.ListenAndServe() }
+	}
+	err := serve(srv)
+	stop()
+	background.Wait()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("HTTP 服务失败: %w", err)
 	}
 	return nil
@@ -170,16 +230,31 @@ func (s *Server) Run(ctx context.Context) error {
 // 故仅在初始连接失败时退避重试。验证码/密码经 webCode/webPassword 注入。
 func (s *Server) runTelegram(ctx context.Context) {
 	delay := initialReconnectDelay
+	credentialSubmission := false
+	defer func() {
+		if credentialSubmission {
+			s.releaseCredentialSubmission()
+		}
+	}()
 	for {
 		// 凭据缺失时，等待 Web 端提交 API ID/Hash/手机号
 		if !s.client.HasCredentials() {
 			s.setState(StateNeedCredentials)
 			select {
 			case <-s.credCh:
+				credentialSubmission = true
 				delay = initialReconnectDelay
 			case <-ctx.Done():
 				s.client.Close()
 				return
+			}
+		} else if !credentialSubmission {
+			// 凭据可能刚好在重试计时结束后入队；先消费信号，确保槽位会在本轮认证后释放。
+			select {
+			case <-s.credCh:
+				credentialSubmission = true
+				delay = initialReconnectDelay
+			default:
 			}
 		}
 
@@ -187,6 +262,10 @@ func (s *Server) runTelegram(ctx context.Context) {
 		s.setState(StateConnecting)
 		err := s.client.AuthenticateWith(ctx, s.webCode, s.webPassword)
 		if ctx.Err() != nil {
+			if credentialSubmission {
+				s.releaseCredentialSubmission()
+				credentialSubmission = false
+			}
 			s.client.Close()
 			return
 		}
@@ -199,22 +278,43 @@ func (s *Server) runTelegram(ctx context.Context) {
 				if perr := s.client.ClearPhone(); perr != nil {
 					s.logger.Warn("清除手机号失败: %v", perr)
 				}
+				if credentialSubmission {
+					s.releaseCredentialSubmission()
+					credentialSubmission = false
+				}
 				delay = initialReconnectDelay
 				continue
 			}
 			s.setError(err)
 			s.logger.Error("Telegram 连接失败，%s 后重试: %v", delay, err)
+			if credentialSubmission {
+				s.releaseCredentialSubmission()
+				credentialSubmission = false
+			}
 			// 退避等待；若用户期间重新提交凭据则立即重试
 			select {
 			case <-time.After(delay):
 				delay = min(delay*reconnectFactor, maxReconnectDelay)
 			case <-s.credCh:
+				credentialSubmission = true
 				delay = initialReconnectDelay
 			case <-ctx.Done():
 				s.client.Close()
 				return
 			}
 			continue
+		}
+		if credentialSubmission {
+			s.releaseCredentialSubmission()
+			credentialSubmission = false
+		}
+		if s.queueDraining.Load() {
+			if err := s.queue.EndDrain(); err != nil {
+				s.setError(err)
+				s.logger.Error("恢复任务队列失败: %v", err)
+				continue
+			}
+			s.queueDraining.Store(false)
 		}
 
 		s.setState(StateReady)
@@ -232,6 +332,22 @@ func (s *Server) runTelegram(ctx context.Context) {
 			s.mu.Unlock()
 			delay = initialReconnectDelay
 		}
+	}
+}
+
+func (s *Server) reserveCredentialSubmission() bool {
+	select {
+	case s.credSlot <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseCredentialSubmission() {
+	select {
+	case <-s.credSlot:
+	default:
 	}
 }
 
@@ -292,6 +408,17 @@ func (s *Server) currentState() (state State, errMsg string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.state, s.stateErr
+}
+
+func (s *Server) beginLogout() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != StateReady {
+		return false
+	}
+	s.state = StateConnecting
+	s.stateErr = ""
+	return true
 }
 
 func (s *Server) refreshChats(ctx context.Context) {
@@ -355,6 +482,7 @@ func (s *Server) snapshot() stateSnapshot {
 		MediaConcurrency: downloadSettingsDTO{MaxConcurrent: s.client.DownloadConcurrency(), Active: s.client.ActiveDownloadCount()},
 		AllPaused:        s.client.AllMediaPaused(),
 		SpeedBps:         s.client.DownloadSpeed(),
+		Connection:       s.client.ConnectionState(),
 	}
 }
 
@@ -371,11 +499,13 @@ func (s *Server) activeTaskCount() int {
 }
 
 func maskPhone(phone string) string {
-	if len(phone) <= phoneMaskKeepHead+phoneMaskKeepTail {
+	runes := []rune(phone)
+	if len(runes) <= phoneMaskKeepHead+phoneMaskKeepTail {
 		return phone
 	}
-	return phone[:phoneMaskKeepHead] + strings.Repeat("*", len(phone)-phoneMaskKeepHead-phoneMaskKeepTail) +
-		phone[len(phone)-phoneMaskKeepTail:]
+	return string(runes[:phoneMaskKeepHead]) +
+		strings.Repeat("*", len(runes)-phoneMaskKeepHead-phoneMaskKeepTail) +
+		string(runes[len(runes)-phoneMaskKeepTail:])
 }
 
 // --- DTOs ---
@@ -402,6 +532,9 @@ type stateSnapshot struct {
 	MediaConcurrency downloadSettingsDTO        `json:"media_concurrency"`
 	AllPaused        bool                       `json:"all_paused"`
 	SpeedBps         int64                      `json:"speed_bps"`
+	// Connection 是 TDLib 的网络连接状态（ready/connecting/updating/waiting_network），
+	// 让界面能解释"进度条不动"是因为断网，而不是程序卡死
+	Connection string `json:"connection,omitempty"`
 }
 
 type logEntry struct {

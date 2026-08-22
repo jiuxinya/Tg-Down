@@ -28,9 +28,26 @@ const (
 	StatusQueued    Status = "queued"
 	StatusRunning   Status = "running"
 	StatusCompleted Status = "completed"
-	StatusFailed    Status = "failed"
-	StatusCanceled  Status = "canceled"
+	// StatusPartial 表示历史已完整扫完，但有文件下载失败。
+	//
+	// 没有这个状态时，"扫描成功"就被等同于"任务成功"：哪怕每一个文件都下载失败，任务
+	// 依然显示绿色的"已完成"。失败的文件仍留在 history 表中，可经重试补下。
+	StatusPartial  Status = "partial"
+	StatusFailed   Status = "failed"
+	StatusCanceled Status = "canceled"
 )
+
+// IsTerminal 报告状态是否为终态（不会再自行变化）
+func (s Status) IsTerminal() bool {
+	switch s {
+	case StatusCompleted, StatusPartial, StatusFailed, StatusCanceled:
+		return true
+	case StatusQueued, StatusRunning:
+		return false
+	default:
+		return false
+	}
+}
 
 // history 任务运行阶段常量（仅内存态，不落库；重启后 running 任务从持久化游标恢复续跑）
 const (
@@ -42,9 +59,9 @@ const (
 // 使本包可在无真实 TDLib 连接的情况下进行单元测试。
 type ChatDownloader interface {
 	CountHistoryMedia(ctx context.Context, chatID int64, mediaTypes []string) (int64, error)
-	DownloadHistoryMedia(ctx context.Context, spec *downloader.HistorySpec) error
-	SetMonitorTask(taskID string, chatID int64)
-	SetRecordFunc(fn func(context.Context, downloader.RecordEvent))
+	DownloadHistoryMedia(ctx context.Context, spec *downloader.HistorySpec) (*downloader.HistoryResult, error)
+	SetMonitorTask(taskID string, chatID int64, chatTitle string)
+	SetRecordFunc(fn func(context.Context, *downloader.RecordEvent))
 	SetScanProgressFunc(fn func(taskID string, scannedMessages, foundMedia, scanCursor int64))
 	SetDuplicateLookupFunc(fn func(ctx context.Context, uniqueID string) (existingPath string, ok bool))
 }
@@ -76,4 +93,9 @@ type TaskDTO struct {
 	Filters *downloader.HistoryFilters `json:"filters,omitempty"`
 	// MessageID 非 0 时为单消息下载任务（t.me 消息链接）
 	MessageID int64 `json:"message_id,omitempty"`
+
+	// 以下字段仅用于持久化内部运行态，不对 API 输出。
+	StopAtMessageID int64  `json:"-"`
+	ScheduleID      string `json:"-"`
+	RetryFailedOnly bool   `json:"-"`
 }

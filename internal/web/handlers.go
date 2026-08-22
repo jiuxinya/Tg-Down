@@ -3,17 +3,22 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"tg-down/internal/config"
 	"tg-down/internal/downloader"
 	"tg-down/internal/queue"
 	"tg-down/internal/store"
-	"tg-down/internal/telegram"
+	"tg-down/internal/tgapi"
 )
 
 // routes 注册所有 HTTP 路由
@@ -43,19 +48,57 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/media/resume-all", s.handleMediaResumeAll)
 	mux.HandleFunc("GET /api/history", s.handleHistoryList)
 	mux.HandleFunc("GET /api/history/stats", s.handleHistoryStats)
+	mux.HandleFunc("GET /api/history/{id}/file", s.handleHistoryFile)
+	mux.HandleFunc("GET /api/history/{id}/thumb", s.handleHistoryThumb)
+	mux.HandleFunc("POST /api/export", s.handleExport)
 	mux.HandleFunc("GET /api/schedules", s.handleSchedulesList)
 	mux.HandleFunc("POST /api/schedules", s.handleSchedulesCreate)
 	mux.HandleFunc("DELETE /api/schedules/{id}", s.handleScheduleDelete)
 	mux.HandleFunc("POST /api/schedules/{id}/toggle", s.handleScheduleToggle)
 }
 
+// uiNotBuiltMessage 在前端产物缺失时给出的提示（而不是白屏让人一头雾水）
+const uiNotBuiltMessage = `<!doctype html><meta charset="utf-8"><title>Tg-Down</title>
+<body style="font-family:system-ui;padding:40px;line-height:1.6">
+<h1>前端尚未构建</h1>
+<p>这个二进制是在没有前端产物的情况下编译的。请执行：</p>
+<pre style="background:#f2f2f7;padding:12px;border-radius:8px">make web &amp;&amp; make build</pre>
+<p>API 仍然可用（<code>/api/...</code>）。</p>
+</body>`
+
+// handleIndex 提供前端：静态资源直接从内嵌的 dist 里取，其余路径回落到 index.html（SPA 路由）。
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if !uiBuilt() {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(uiNotBuiltMessage))
+		return
+	}
+
+	// 带扩展名的路径当作静态资源；命中就直接返回（带上长缓存——Vite 的文件名里有内容哈希）
+	name := strings.TrimPrefix(r.URL.Path, "/")
+	if name != "" && path.Ext(name) != "" {
+		if f, err := uiFS.Open(name); err == nil {
+			_ = f.Close()
+			if strings.HasPrefix(name, "assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
+			http.FileServerFS(uiFS).ServeHTTP(w, r)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
+
+	// 其余一律回 index.html，交给前端路由
+	data, err := fs.ReadFile(uiFS, "index.html")
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "读取前端产物失败")
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(indexHTML)
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
@@ -67,28 +110,28 @@ func (s *Server) handleChats(w http.ResponseWriter, _ *http.Request) {
 	chats := s.chats
 	s.mu.RUnlock()
 	if chats == nil {
-		chats = []telegram.ChatInfo{}
+		chats = []tgapi.ChatInfo{}
 	}
 	s.writeJSON(w, chats)
 }
 
-func (s *Server) handleChatsRefresh(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleChatsRefresh(w http.ResponseWriter, r *http.Request) {
 	if !s.requireReady(w) {
 		return
 	}
-	s.refreshChats(context.Background())
+	s.refreshChats(r.Context())
 	s.mu.RLock()
 	chats := s.chats
 	s.mu.RUnlock()
 	if chats == nil {
-		chats = []telegram.ChatInfo{}
+		chats = []tgapi.ChatInfo{}
 	}
 	s.writeJSON(w, chats)
 }
 
 func (s *Server) handleAuthCredentials(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		APIID   int    `json:"api_id"`
+		APIID   int64  `json:"api_id"`
 		APIHash string `json:"api_hash"`
 		Phone   string `json:"phone"`
 	}
@@ -97,12 +140,35 @@ func (s *Server) handleAuthCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	body.APIHash = strings.TrimSpace(body.APIHash)
 	body.Phone = strings.TrimSpace(body.Phone)
-	if body.APIID == 0 || body.APIHash == "" || body.Phone == "" {
-		s.writeError(w, http.StatusBadRequest, "api_id、api_hash、手机号均不能为空")
+	if !config.IsValidAPIID(body.APIID) {
+		s.writeError(w, http.StatusBadRequest, "api_id 必须为有效的正整数")
 		return
 	}
+	if !config.IsValidAPIHash(body.APIHash) {
+		s.writeError(w, http.StatusBadRequest, "api_hash 必须为 32 位十六进制字符串")
+		return
+	}
+	if !config.IsValidPhone(body.Phone) {
+		s.writeError(w, http.StatusBadRequest, "手机号必须为国际格式（+ 后跟 7 到 15 位数字）")
+		return
+	}
+	state, _ := s.currentState()
+	if state != StateNeedCredentials && state != StateError {
+		s.writeError(w, http.StatusConflict, "当前认证步骤不能修改 API 凭据")
+		return
+	}
+	if !s.reserveCredentialSubmission() {
+		s.writeError(w, http.StatusConflict, "登录请求处理中，请稍候")
+		return
+	}
+	queued := false
+	defer func() {
+		if !queued {
+			s.releaseCredentialSubmission()
+		}
+	}()
 
-	s.client.SetCredentials(body.APIID, body.APIHash, body.Phone)
+	s.client.SetCredentials(int(body.APIID), body.APIHash, body.Phone)
 	if err := s.client.SaveConfig(); err != nil {
 		s.logger.Warn("保存配置失败（不影响本次登录）: %v", err)
 	} else {
@@ -111,9 +177,11 @@ func (s *Server) handleAuthCredentials(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case s.credCh <- struct{}{}:
+		queued = true
 		s.writeOK(w)
 	default:
-		s.writeError(w, http.StatusConflict, "登录请求处理中，请稍候")
+		// credSlot 与 credCh 同容量，正常运行不会走到这里；保留防御性错误，避免阻塞请求。
+		s.writeError(w, http.StatusInternalServerError, "登录请求入队失败")
 	}
 }
 
@@ -180,19 +248,50 @@ func (s *Server) handleAuthAbort(w http.ResponseWriter, _ *http.Request) {
 // handleAuthLogout 注销当前 Telegram 会话：先取消所有活动任务，再吊销授权并销毁本地会话，
 // 最后通知 runTelegram 重新进入认证循环（回到凭据输入页）
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
-	if !s.requireReady(w) {
+	if !s.beginLogout() {
+		s.writeError(w, http.StatusConflict, "Telegram 尚未就绪或正在登出")
 		return
 	}
-	tasks := s.queue.List()
-	for i := range tasks {
-		t := &tasks[i]
-		if t.Status == string(queue.StatusQueued) || t.Status == string(queue.StatusRunning) {
-			if err := s.queue.Cancel(t.ID); err != nil {
-				s.logger.Warn("登出前取消任务 %s 失败: %v", t.ID, err)
+	completed := false
+	activeIDs, err := s.queue.BeginDrain()
+	if err != nil {
+		s.setState(StateReady)
+		s.writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.queueDraining.Store(true)
+	defer func() {
+		if !completed {
+			if s.queueDraining.Load() {
+				if err := s.queue.EndDrain(); err != nil {
+					s.logger.Error("恢复任务队列失败: %v", err)
+				} else {
+					s.queueDraining.Store(false)
+				}
 			}
+			s.setState(StateReady)
+		}
+	}()
+	for _, id := range activeIDs {
+		if err := s.queue.Cancel(id); err != nil {
+			// BeginDrain 也返回已到终态但尚未完成持久化/通知的任务；这类任务无需再次取消，
+			// 仍必须在下面 Wait 到 done 关闭。
+			s.logger.Warn("登出前取消任务 %s 失败: %v", id, err)
 		}
 	}
-	if err := s.client.Logout(r.Context()); err != nil {
+	logoutCtx, cancel := context.WithTimeout(r.Context(), logoutTaskWaitTimeout)
+	defer cancel()
+	for _, id := range activeIDs {
+		if err := s.queue.Wait(logoutCtx, id); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+			}
+			s.writeError(w, status, "等待下载任务结束失败: "+err.Error())
+			return
+		}
+	}
+	if err := s.client.Logout(logoutCtx); err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -200,6 +299,7 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	case s.logoutCh <- struct{}{}:
 	default:
 	}
+	completed = true
 	s.writeOK(w)
 }
 
@@ -262,8 +362,20 @@ func (s *Server) handleTasksCreate(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "kind 必须为 history 或 monitor")
 		return
 	}
+	if body.ChatID == 0 {
+		s.writeError(w, http.StatusBadRequest, "chat_id 不能为空")
+		return
+	}
+	if body.MessageID < 0 {
+		s.writeError(w, http.StatusBadRequest, "message_id 不能为负")
+		return
+	}
 	if msg := body.Filters.Validate(); msg != "" {
 		s.writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	if kind == queue.KindMonitor && (!body.Filters.IsZero() || body.MessageID != 0) {
+		s.writeError(w, http.StatusBadRequest, "monitor 任务不支持 filters 或 message_id")
 		return
 	}
 	if !s.requireReady(w) {
@@ -280,6 +392,48 @@ func (s *Server) handleTasksCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, dto)
+}
+
+// handleExport 把一个聊天导出为 JSON + 自包含 HTML。
+//
+// 同步执行：导出要翻完整条历史，大频道会很慢，因此请求上下文即取消信号——
+// 用户关掉页面，导出随之停止，不会留下一个无人认领的后台任务。
+// limit 由前端传入以便先小规模试一次，0 = 全量。
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ChatID    int64  `json:"chat_id"`
+		ChatTitle string `json:"chat_title"`
+		Limit     int    `json:"limit"`
+	}
+	if !s.decode(w, r, &body) {
+		return
+	}
+	if body.ChatID == 0 {
+		s.writeError(w, http.StatusBadRequest, "chat_id 不能为空")
+		return
+	}
+	if body.Limit < 0 {
+		s.writeError(w, http.StatusBadRequest, "limit 不能为负")
+		return
+	}
+	if !s.requireReady(w) {
+		return
+	}
+
+	title := body.ChatTitle
+	if title == "" {
+		title = s.chatTitle(body.ChatID)
+	}
+	res, err := s.client.ExportChat(r.Context(), tgapi.ExportSpec{
+		ChatID:    body.ChatID,
+		ChatTitle: title,
+		Limit:     body.Limit,
+	})
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.writeJSON(w, res)
 }
 
 // handleResolve 解析 t.me 链接 / @用户名为聊天与可选消息 id，供前端确认后创建任务
@@ -351,6 +505,10 @@ func (s *Server) handleSchedulesCreate(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("间隔不能小于 %d 分钟", queue.MinScheduleIntervalMin))
 		return
 	}
+	if int64(body.IntervalMin) > queue.MaxScheduleIntervalMin {
+		s.writeError(w, http.StatusBadRequest, "计划间隔过大")
+		return
+	}
 	if msg := body.Filters.Validate(); msg != "" {
 		s.writeError(w, http.StatusBadRequest, msg)
 		return
@@ -391,12 +549,16 @@ func (s *Server) handleScheduleDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleScheduleToggle(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Enabled bool `json:"enabled"`
+		Enabled *bool `json:"enabled"`
 	}
 	if !s.decode(w, r, &body) {
 		return
 	}
-	if err := s.store.SetScheduleEnabled(r.Context(), r.PathValue("id"), body.Enabled); err != nil {
+	if body.Enabled == nil {
+		s.writeError(w, http.StatusBadRequest, "enabled 字段不能为空")
+		return
+	}
+	if err := s.store.SetScheduleEnabled(r.Context(), r.PathValue("id"), *body.Enabled); err != nil {
 		s.writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -513,6 +675,9 @@ func (s *Server) handleHistoryStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) parseHistoryFilter(w http.ResponseWriter, r *http.Request) (filter store.HistoryFilter, page, pageSize int, ok bool) {
 	q := r.URL.Query()
 	filter.MediaType = q.Get("type")
+	if filter.MediaType == "" {
+		filter.MediaType = q.Get("media_type") // 兼容 v3.0 早期前端
+	}
 	filter.Status = q.Get("status")
 	filter.Query = q.Get("q")
 
@@ -541,20 +706,20 @@ func (s *Server) parseHistoryFilter(w http.ResponseWriter, r *http.Request) (fil
 	page = 1
 	if v := q.Get("page"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil {
+		if err != nil || n <= 0 {
 			s.writeError(w, http.StatusBadRequest, "page 格式错误")
 			return filter, 0, 0, false
 		}
 		page = n
 	}
-	pageSize = 0
+	pageSize = store.DefaultHistoryPageSize
 	if v := q.Get("page_size"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil {
+		if err != nil || n <= 0 {
 			s.writeError(w, http.StatusBadRequest, "page_size 格式错误")
 			return filter, 0, 0, false
 		}
-		pageSize = n
+		pageSize = min(n, store.MaxHistoryPageSize)
 	}
 	return filter, page, pageSize, true
 }
@@ -583,7 +748,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Cache-Control", "no-store")
 	h.Set("Connection", "keep-alive")
 
 	ch := s.hub.add()
@@ -623,6 +788,11 @@ type historyRecordDTO struct {
 	Reason     string `json:"reason,omitempty"`
 	CreatedAt  int64  `json:"created_at"`
 	FinishedAt *int64 `json:"finished_at,omitempty"`
+	// AlbumID 让前端能把同一相册的媒体聚成一组。库里一直有这一列、文件也一直按
+	// album_<id> 分目录，唯独 DTO 把它丢了，画廊因此拼不出相册。
+	AlbumID int64 `json:"album_id,omitempty"`
+	// HasThumb 为真时 GET /api/history/{id}/thumb 有内容可返回
+	HasThumb bool `json:"has_thumb"`
 }
 
 func toHistoryRecordDTO(rec *store.HistoryRecord) historyRecordDTO {
@@ -640,6 +810,8 @@ func toHistoryRecordDTO(rec *store.HistoryRecord) historyRecordDTO {
 		Status:    rec.Status,
 		Reason:    rec.Reason,
 		CreatedAt: rec.CreatedAt.Unix(),
+		AlbumID:   rec.AlbumID,
+		HasThumb:  rec.ThumbPath != "" || len(rec.Minithumb) > 0,
 	}
 	if rec.FinishedAt != nil {
 		sec := rec.FinishedAt.Unix()
@@ -707,8 +879,18 @@ func (s *Server) writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 func (s *Server) decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(v); err != nil {
 		s.writeError(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			s.writeError(w, http.StatusBadRequest, "请求体只能包含一个 JSON 值")
+		} else {
+			s.writeError(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		}
 		return false
 	}
 	return true

@@ -33,6 +33,14 @@ func nullString(s string) driver.Value {
 	return s
 }
 
+// nullBytes 把空字节切片落库为 NULL，便于用 COALESCE 做"有则不覆盖"的更新
+func nullBytes(b []byte) driver.Value {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
 // unixToTime 将 unix 秒时间戳转换为 time.Time
 func unixToTime(sec int64) time.Time {
 	return time.Unix(sec, 0)

@@ -3,6 +3,15 @@ api:
   hash: ""  # 你的API Hash
   phone: ""  # 你的手机号
 
+# Telegram 连接代理（可选）。服务器所在网络无法直连 Telegram 时必须配置，
+# 否则启动后会一直卡在"正在连接 Telegram"。注意：TDLib 不读 HTTP_PROXY/HTTPS_PROXY
+# 环境变量，但本程序会按 telegram.proxy > TG_PROXY > ALL_PROXY > HTTPS_PROXY > HTTP_PROXY
+# 的顺序取第一个非空值作为代理。
+# 支持: socks5://[user:pass@]host:port 、 http://[user:pass@]host:port（HTTP CONNECT）、
+#       mtproto://secret@host:port ；特殊值 direct/off/none 强制直连（忽略环境变量）
+# telegram:
+#   proxy: "socks5://127.0.0.1:1080"
+
 # 注：chunk_size / max_workers / rate_limit.* 已在 v2.0 移除（TDLib 自管分片/并行度/限流）
 download:
   path: "./downloads"  # 下载路径
@@ -11,6 +20,8 @@ download:
   partition_size: 100  # 历史下载在途媒体上限（扫描最多领先下载的数量）
   save_metadata: false # 为 true 时在每个下载文件旁写 <文件>.json 元数据（caption/发送者/日期等）
   disable_classify_by_type: false  # 按媒体类型归档默认开启；设为 true 可恢复旧版扁平目录布局
+  # 必须含 {chat_id}，并至少含 {name} 或 {msg_id}；以下值就是默认布局
+  path_template: "chat_{chat_id}/{type}/{album}/{name}"
 
 chat:
   target_id: 0  # 目标群组ID (可选，留空则运行时交互选择)

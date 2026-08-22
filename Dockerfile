@@ -1,8 +1,16 @@
 # syntax=docker/dockerfile:1
-# 多阶段构建：builder 编译 TDLib 与 Go 二进制，runtime 仅带运行时依赖。
+# 多阶段构建：webbuild 出前端产物，build 编译 TDLib 与 Go 二进制，runtime 仅带运行时依赖。
 # TDLib 层只依赖 scripts/install-tdlib.sh，源码变更不会触发耗时的 TDLib 重建。
 
-FROM golang:1.25-bookworm AS build
+# 前端层：只依赖 web/，改 Go 代码不会触发前端重建
+FROM node:22-bookworm-slim AS webbuild
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+FROM golang:1.25.12-bookworm AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       cmake gperf g++ make git zlib1g-dev libssl-dev \
@@ -19,13 +27,16 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# 前端产物（webbuild 阶段的 vite outDir 是 ../internal/web/static/dist，即 /internal/...）
+COPY --from=webbuild /internal/web/static/dist ./internal/web/static/dist
 ARG VERSION=dev
 # linux 下 go-tdlib 绑定默认静态链接（tdjson_static），但其列表缺 tde2e 且 -L 指向
 # /usr/local/lib，这里统一补全
 ENV CGO_ENABLED=1 \
-    CGO_CFLAGS="-I/opt/tdlib/include" \
-    CGO_LDFLAGS="-L/opt/tdlib/lib -ltdjson_static -ltdjson_private -ltdclient -ltdcore -ltde2e -ltdmtproto -ltdactor -ltdapi -ltddb -ltdsqlite -ltdnet -ltdutils -lstdc++ -lssl -lcrypto -ldl -lz -lm"
-RUN go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/tg-down ./cmd
+    CGO_CFLAGS="-I/opt/tdlib/include"
+# 静态库列表取自 scripts/tdlib-libs.sh（唯一来源）
+RUN CGO_LDFLAGS="-L/opt/tdlib/lib $(bash scripts/tdlib-libs.sh --print)" \
+      go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/tg-down ./cmd
 
 FROM debian:12-slim
 
@@ -37,11 +48,12 @@ COPY --from=build /out/tg-down /usr/local/bin/tg-down
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# 纯环境变量运行：无 config.yaml，凭据经 API_ID/API_HASH（或网页登录）注入
+# 运行目录位于持久卷：网页填写的 API 凭据会以 0600 写入 /data/config.yaml，容器重建后仍可读取。
+# API_ID/API_HASH/PHONE 环境变量仍按既有优先级覆盖文件值。
+WORKDIR /data
 ENV STORE_PATH=/data/tg-down.db \
     SESSION_DIR=/sessions \
     DOWNLOAD_PATH=/downloads \
-    TG_DOWN_NO_CONFIG_WRITE=1 \
     PUID=1000 \
     PGID=1000
 

@@ -49,16 +49,21 @@ linters:
             - tg-down/internal/logger
             - tg-down/internal/telegram
             - tg-down/internal/downloader
+            - tg-down/internal/media
             - tg-down/internal/web
             - tg-down/internal/retry
             - tg-down/internal/store
             - tg-down/internal/queue
             - tg-down/internal/notify
+            - tg-down/internal/tgapi
     dupl:
       threshold: 100
     goconst:
       min-len: 2
       min-occurrences: 2
+      # 测试文件已在 exclusions.paths 中排除报告，若仍计入出现次数，会让"被测值在测试里
+      # 各写一次"误报为重复字面量。计数口径与报告口径保持一致。
+      ignore-tests: true
     gocritic:
       disabled-checks:
         - dupImport

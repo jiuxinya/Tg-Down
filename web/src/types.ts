@@ -1,0 +1,169 @@
+export interface Stats {
+  total: number
+  downloaded: number
+  failed: number
+  skipped: number
+  total_size: number
+  downloaded_size: number
+}
+
+export interface MediaProgress {
+  id: string
+  task_id?: string
+  message_id?: number
+  td_file_id?: number
+  chat_id?: number
+  file_name: string
+  media_type: string
+  file_size: number
+  downloaded_size: number
+  percent?: number
+  status: string
+  paused?: boolean
+  file_path?: string
+  started_at?: string
+  updated_at?: string
+  speed_bps?: number
+  eta_seconds?: number
+}
+
+export interface HistoryFilters {
+  media_types?: string[]
+  date_from?: number
+  date_to?: number
+  max_file_size?: number
+  query?: string
+  sender_id?: number
+}
+
+export interface Task {
+  id: string
+  kind: string
+  chat_id: number
+  chat_title?: string
+  status: string
+  error?: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  stats: Stats
+  phase?: string
+  expected_total?: number
+  scanned_messages?: number
+  found_media?: number
+  scan_cursor?: number
+  attempts?: number
+  filters?: HistoryFilters | null
+  message_id?: number
+}
+
+export interface Chat {
+  id: number
+  title: string
+  type?: string
+  unread?: number
+}
+
+export interface LogEntry {
+  time: string
+  level: string
+  msg: string
+}
+
+export interface StateSnapshot {
+  version: string
+  state: string
+  error?: string
+  phone?: string
+  target_chat: number
+  active_tasks: number
+  stats: Stats
+  media: MediaProgress[]
+  media_concurrency?: DownloadSettings
+  all_paused?: boolean
+  speed_bps?: number
+  connection?: string
+}
+
+export interface HistoryRecord {
+  id: number
+  task_id?: string
+  chat_id: number
+  chat_title?: string
+  message_id: number
+  media_type: string
+  file_name: string
+  file_path: string
+  file_size: number
+  mime_type?: string
+  status: string
+  reason?: string
+  created_at: number
+  finished_at?: number
+  album_id?: number
+  has_thumb: boolean
+}
+
+export interface HistoryPage {
+  items: HistoryRecord[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface MediaTypeStat {
+  media_type: string
+  count: number
+  total_size: number
+  completed: number
+  failed: number
+  skipped: number
+}
+
+export interface HistoryStatsResponse {
+  by_type: MediaTypeStat[]
+}
+
+export interface DownloadSettings {
+  max_concurrent: number
+  active: number
+}
+
+export interface OKResponse {
+  status: 'ok'
+}
+
+export interface ResolvedTarget {
+  chat_id: number
+  chat_title?: string
+  message_id?: number
+}
+
+export interface Schedule {
+  id: string
+  chat_id: number
+  chat_title?: string
+  interval_min: number
+  filters?: string
+  enabled: boolean
+  last_run?: string
+  created_at: string
+  last_max_id?: number
+}
+
+export interface Settings {
+  download_path: string
+  classify_by_type: boolean
+  media_concurrency: DownloadSettings
+}
+
+export interface ExportResult {
+  json_path: string
+  html_path: string
+  messages: number
+  media_count: number
+  media_on_disk: number
+  truncated: boolean
+  chat_title?: string
+  exported_at?: number
+}

@@ -13,7 +13,7 @@
 **包含的作业**:
 
 #### 1. 测试作业 (test)
-- **环境**: Ubuntu Latest, Go 1.25（TDLib 经 `.github/actions/setup-tdlib` 构建并缓存）
+- **环境**: Ubuntu Latest, Go 1.25.12（TDLib 经 `.github/actions/setup-tdlib` 构建并缓存）
 - **步骤**:
   - 检出代码
   - 设置Go环境与 TDLib CGo 环境

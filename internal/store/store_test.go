@@ -1,12 +1,16 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+
+	"tg-down/internal/downloader"
 )
 
 // newTestStore 创建一个基于临时文件的测试用 Store
@@ -27,13 +31,16 @@ func TestTaskCRUDRoundTrip(t *testing.T) {
 
 	created := time.Now().Add(-time.Hour).Truncate(time.Second)
 	task := &TaskRow{
-		ID:            "task-1",
-		Kind:          "scan",
-		ChatID:        100,
-		ChatTitle:     "测试群组",
-		Status:        TaskStatusQueued,
-		CreatedAt:     created,
-		ExpectedTotal: 42,
+		ID:              "task-1",
+		Kind:            "scan",
+		ChatID:          100,
+		ChatTitle:       "测试群组",
+		Status:          TaskStatusQueued,
+		CreatedAt:       created,
+		ExpectedTotal:   42,
+		StopAtMessageID: 321,
+		ScheduleID:      "schedule-1",
+		RetryFailedOnly: true,
 	}
 	if err := s.CreateTask(ctx, task); err != nil {
 		t.Fatalf("CreateTask() error = %v", err)
@@ -48,6 +55,9 @@ func TestTaskCRUDRoundTrip(t *testing.T) {
 	}
 	if got.Kind != "scan" || got.ChatTitle != "测试群组" || got.Status != TaskStatusQueued || got.ExpectedTotal != 42 {
 		t.Fatalf("GetTask() = %+v, mismatch", got)
+	}
+	if got.StopAtMessageID != 321 || got.ScheduleID != "schedule-1" || !got.RetryFailedOnly {
+		t.Fatalf("task runtime fields did not round trip: %+v", got)
 	}
 	if got.StartedAt != nil || got.FinishedAt != nil {
 		t.Fatalf("GetTask() StartedAt/FinishedAt should be nil initially, got %+v/%+v", got.StartedAt, got.FinishedAt)
@@ -80,6 +90,7 @@ func TestTaskCRUDRoundTrip(t *testing.T) {
 	if err := s.UpdateTaskProgress(ctx, "task-1", TaskProgress{
 		Total: 10, Downloaded: 6, Failed: 2, Skipped: 2,
 		TotalSize: 1000, DownloadedSize: 600, ExpectedTotal: 50, ScanCursor: 12345, Attempts: 1,
+		RetryFailedOnly: true,
 	}); err != nil {
 		t.Fatalf("UpdateTaskProgress() error = %v", err)
 	}
@@ -89,6 +100,9 @@ func TestTaskCRUDRoundTrip(t *testing.T) {
 	}
 	if got.ExpectedTotal != 50 || got.ScanCursor != 12345 || got.Attempts != 1 {
 		t.Fatalf("ExpectedTotal/ScanCursor/Attempts = %d/%d/%d, want 50/12345/1", got.ExpectedTotal, got.ScanCursor, got.Attempts)
+	}
+	if !got.RetryFailedOnly {
+		t.Fatal("RetryFailedOnly progress flag was not persisted")
 	}
 
 	if err := s.UpdateTaskStatus(ctx, "task-1", TaskStatusFailed, "网络错误"); err != nil {
@@ -113,6 +127,30 @@ func TestTaskCRUDRoundTrip(t *testing.T) {
 	}
 	if len(list) != 2 || list[0].ID != "task-2" || list[1].ID != "task-1" {
 		t.Fatalf("ListTasks() = %+v, want [task-2, task-1]", list)
+	}
+}
+
+func TestPartialTaskRecordsFinishedAtAndRetryClearsIt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateTask(ctx, &TaskRow{
+		ID: "partial-1", Kind: "history", ChatID: 1, Status: TaskStatusRunning, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTaskStatus(ctx, "partial-1", TaskStatusPartial, "one failed"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTask(ctx, "partial-1")
+	if err != nil || got == nil || got.FinishedAt == nil {
+		t.Fatalf("partial task must have finished_at: row=%+v err=%v", got, err)
+	}
+	if err := s.UpdateTaskStatus(ctx, "partial-1", TaskStatusQueued, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetTask(ctx, "partial-1")
+	if got.FinishedAt != nil || got.StartedAt != nil {
+		t.Fatalf("requeued partial task retained terminal timestamps: %+v", got)
 	}
 }
 
@@ -188,6 +226,122 @@ func TestOpenCreatesParentDirectory(t *testing.T) {
 	}
 }
 
+func TestOpenRestrictsDatabaseFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission bits")
+	}
+	path := filepath.Join(t.TempDir(), "private.db")
+	// 模拟旧版本在宽松 umask 下留下的数据库文件。
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			t.Fatalf("expected SQLite file %s: %v", filepath.Base(candidate), err)
+		}
+		if got := info.Mode().Perm(); got != databaseFilePermission {
+			t.Errorf("%s permissions = %o, want %o", filepath.Base(candidate), got, databaseFilePermission)
+		}
+	}
+}
+
+func TestOpenRestrictsPermissionsBeforeSchemaFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission bits")
+	}
+	path := filepath.Join(t.TempDir(), "invalid.db")
+	if err := os.WriteFile(path, []byte("not a sqlite database"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("Open(invalid database) unexpectedly succeeded")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != databaseFilePermission {
+		t.Fatalf("database permissions after schema failure = %o, want %o", got, databaseFilePermission)
+	}
+}
+
+func TestOpenSupportsSpecialCharactersInDatabasePath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data ?#%")
+	path := filepath.Join(dir, "store ?#%.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(special path) error = %v", err)
+	}
+	if err := s.CreateTask(context.Background(), &TaskRow{
+		ID: "special", Kind: "history", ChatID: 1, Status: TaskStatusQueued, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("database was not created at the literal path: %v", err)
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen(special path) error = %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	row, err := s.GetTask(context.Background(), "special")
+	if err != nil || row == nil {
+		t.Fatalf("data missing after special-path reopen: row=%+v err=%v", row, err)
+	}
+}
+
+// TestOpenSupportsRelativeDatabasePath 是 sqliteDSN 相对路径回归测试：相对路径拼进
+// file URI 时（file://./x.db）SQLite 会把 "./" 当 authority 并报 invalid uri authority，
+// 而默认存储路径正是相对的 ./tg-down.db。
+func TestOpenSupportsRelativeDatabasePath(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	s, err := Open("./nested/tg-down.db")
+	if err != nil {
+		t.Fatalf("Open(relative path) error = %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(tmp, "nested", "tg-down.db")
+	if _, err := os.Stat(abs); err != nil {
+		t.Fatalf("database was not created at the resolved path: %v", err)
+	}
+}
+
+func TestSqliteDSNConvertsRelativePathToAbsoluteURI(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	got := sqliteDSN("./data/tg-down.db")
+	want := "file://" + filepath.ToSlash(filepath.Join(tmp, "data", "tg-down.db")) +
+		"?_pragma=busy_timeout%285000%29&_pragma=journal_mode%28WAL%29&_pragma=synchronous%28NORMAL%29"
+	if got != want {
+		t.Fatalf("sqliteDSN(relative) = %q, want %q", got, want)
+	}
+	if dsn := sqliteDSN(inMemoryDSN); dsn != "file::memory:?_pragma=busy_timeout%285000%29&_pragma=journal_mode%28WAL%29&_pragma=synchronous%28NORMAL%29" {
+		t.Fatalf("sqliteDSN(:memory:) 应为 opaque 形态（file::memory:），got %q", dsn)
+	}
+}
+
 func TestGetTaskNotFound(t *testing.T) {
 	s := newTestStore(t)
 	got, err := s.GetTask(context.Background(), "missing")
@@ -251,6 +405,52 @@ func TestHistoryUpsertAndUpdateIdempotency(t *testing.T) {
 	}
 	if items[0].Status != HistoryStatusCompleted || items[0].FinishedAt == nil {
 		t.Fatalf("after completed: got = %+v", items[0])
+	}
+}
+
+func TestQueryHistoryIncludesGalleryMetadata(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	mini := []byte{0xff, 0xd8, 0xff}
+	rec := &HistoryRecord{
+		TaskID: "task-gallery", ChatID: 100, ChatTitle: "相册群", MessageID: 8,
+		MediaType: "photo", FileName: "a.jpg", FilePath: "/tmp/a.jpg", FileSize: 10,
+		Status: HistoryStatusQueued, UniqueID: "unique-8", AlbumID: 77, Minithumb: mini,
+	}
+	if err := s.UpsertHistoryStart(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateHistoryResult(ctx, 100, 8, HistoryStatusCompleted, "", rec.FilePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetHistoryThumb(ctx, 100, 8, "/tmp/thumb.jpg"); err != nil {
+		t.Fatal(err)
+	}
+
+	items, _, err := s.QueryHistory(ctx, &HistoryFilter{ChatID: 100})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("QueryHistory() items=%+v err=%v", items, err)
+	}
+	got := items[0]
+	if got.AlbumID != 77 || got.ThumbPath != "/tmp/thumb.jpg" || got.UniqueID != "unique-8" ||
+		!bytes.Equal(got.Minithumb, mini) {
+		t.Fatalf("gallery metadata missing from QueryHistory: %+v", got)
+	}
+}
+
+func TestRecorderReportsStoreErrors(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var recorded error
+	recorder := NewRecorder(s, func(err error) { recorded = err })
+	recorder(context.Background(), &downloader.RecordEvent{
+		Media:  &downloader.MediaInfo{ChatID: 1, MessageID: 1, MediaType: "photo", FileName: "a.jpg"},
+		Status: downloader.RecordQueued,
+	})
+	if recorded == nil {
+		t.Fatal("recorder silently ignored a closed-database write error")
 	}
 }
 
@@ -454,6 +654,43 @@ func TestQueryHistoryFilters(t *testing.T) {
 			t.Fatalf("capped page size returned %d items, want 5 (only 5 rows exist)", len(itemsCapped))
 		}
 	})
+}
+
+func TestQueryHistoryTreatsLikeMetacharactersLiterally(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	names := []string{
+		"literal%percent.txt", "literalXpercent.txt",
+		"under_score.txt", "underXscore.txt",
+		"bang!mark.txt", "bangXmark.txt",
+	}
+	for i, name := range names {
+		if err := s.UpsertHistoryStart(ctx, &HistoryRecord{
+			ChatID: 1, MessageID: int64(i + 1), MediaType: "document", FileName: name,
+			FilePath: "/tmp/" + name, Status: HistoryStatusQueued,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tt := range []struct {
+		query string
+		want  string
+	}{
+		{query: "%", want: "literal%percent.txt"},
+		{query: "_", want: "under_score.txt"},
+		{query: "!", want: "bang!mark.txt"},
+	} {
+		t.Run(tt.query, func(t *testing.T) {
+			items, total, err := s.QueryHistory(ctx, &HistoryFilter{Query: tt.query})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if total != 1 || len(items) != 1 || items[0].FileName != tt.want {
+				t.Fatalf("QueryHistory(%q) = total %d, items %+v", tt.query, total, items)
+			}
+		})
+	}
 }
 
 func TestHistoryStats(t *testing.T) {

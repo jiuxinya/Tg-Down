@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"log"
 
 	"tg-down/internal/downloader"
 )
@@ -11,41 +13,56 @@ import (
 // 包装它以额外更新内存中的任务统计。
 //
 // 权衡：本包不依赖 logger（保持持久层无外部依赖），且下载流程不能因历史记录
-// 写入失败而失败/阻塞，因此这里对存储写入错误一律静默忽略，不 panic、不重试。
+// 写入失败而失败，因此错误交给可选回调报告；未传回调时写入标准日志，不 panic、不重试。
 //
 // 终态记录一律使用 context.Background() 落盘：调用方传入的 ctx 在取消/关停时可能已失效，
 // 若沿用会使被取消下载的 RecordFailed 写入被 database/sql 直接中止，导致 history 行永久停在
 // "downloading"。终态持久化必须不受请求 ctx 取消影响。
-func NewRecorder(s *Store) func(context.Context, downloader.RecordEvent) {
-	return func(_ context.Context, evt downloader.RecordEvent) {
-		if evt.Media == nil {
+func NewRecorder(s *Store, errorHandlers ...func(error)) func(context.Context, *downloader.RecordEvent) {
+	reportError := func(err error) {
+		log.Printf("下载历史持久化失败: %v", err)
+	}
+	if len(errorHandlers) > 0 && errorHandlers[0] != nil {
+		reportError = errorHandlers[0]
+	}
+	return func(_ context.Context, evt *downloader.RecordEvent) {
+		if evt == nil || evt.Media == nil {
 			return
 		}
 		ctx := context.Background()
-
-		switch evt.Status {
-		case downloader.RecordStarted, downloader.RecordSkipped:
-			status := HistoryStatusDownloading
-			if evt.Status == downloader.RecordSkipped {
-				status = HistoryStatusSkipped
+		recordError := func(err error) {
+			if err != nil {
+				reportError(fmt.Errorf("记录 %s 事件失败: %w", evt.Status, err))
 			}
-			_ = s.UpsertHistoryStart(ctx, &HistoryRecord{
+		}
+
+		// 每个媒体恰好写两次：入队时插入 queued 行，终态时更新为 completed/failed/skipped。
+		switch evt.Status {
+		case downloader.RecordQueued:
+			recordError(s.UpsertHistoryStart(ctx, &HistoryRecord{
 				TaskID:    evt.Media.TaskID,
 				ChatID:    evt.Media.ChatID,
+				ChatTitle: evt.Media.ChatTitle,
 				MessageID: evt.Media.MessageID,
 				MediaType: evt.Media.MediaType,
 				FileName:  evt.Media.FileName,
 				FilePath:  evt.FilePath,
 				FileSize:  evt.Media.FileSize,
 				MimeType:  evt.Media.MimeType,
-				Status:    status,
+				Status:    HistoryStatusQueued,
 				UniqueID:  evt.Media.UniqueID,
 				AlbumID:   evt.Media.AlbumID,
-			})
+				Minithumb: evt.Media.Minithumb,
+			}))
 		case downloader.RecordCompleted:
-			_ = s.UpdateHistoryResult(ctx, evt.Media.ChatID, evt.Media.MessageID, HistoryStatusCompleted, "", evt.FilePath)
+			recordError(s.UpdateHistoryResult(ctx, evt.Media.ChatID, evt.Media.MessageID, HistoryStatusCompleted, "", evt.FilePath))
+			if evt.ThumbPath != "" {
+				recordError(s.SetHistoryThumb(ctx, evt.Media.ChatID, evt.Media.MessageID, evt.ThumbPath))
+			}
 		case downloader.RecordFailed:
-			_ = s.UpdateHistoryResult(ctx, evt.Media.ChatID, evt.Media.MessageID, HistoryStatusFailed, evt.Reason, evt.FilePath)
+			recordError(s.UpdateHistoryResult(ctx, evt.Media.ChatID, evt.Media.MessageID, HistoryStatusFailed, evt.Reason, evt.FilePath))
+		case downloader.RecordSkipped:
+			recordError(s.UpdateHistoryResult(ctx, evt.Media.ChatID, evt.Media.MessageID, HistoryStatusSkipped, evt.Reason, evt.FilePath))
 		}
 	}
 }

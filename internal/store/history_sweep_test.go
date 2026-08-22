@@ -61,10 +61,10 @@ func TestSweepInterruptedHistory(t *testing.T) {
 	}
 }
 
-// TestUpdateHistoryResult_CompletedNotDowngradedToFailed 验证终态守卫：
-// 已 completed 的行不会被后续 failed 事件覆盖（并发下载同一消息的落败方），
+// TestUpdateHistoryResult_CompletedNotDowngraded 验证终态守卫：
+// 已 completed 的行不会被复扫产生的 skipped 或并发落败方的 failed 覆盖，
 // 但 failed -> completed（重试成功）仍允许。
-func TestUpdateHistoryResult_CompletedNotDowngradedToFailed(t *testing.T) {
+func TestUpdateHistoryResult_CompletedNotDowngraded(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
@@ -78,9 +78,20 @@ func TestUpdateHistoryResult_CompletedNotDowngradedToFailed(t *testing.T) {
 	if err := s.UpdateHistoryResult(ctx, 100, 1, HistoryStatusCompleted, "", "/tmp/a.jpg"); err != nil {
 		t.Fatalf("UpdateHistoryResult(completed) error = %v", err)
 	}
-	// 落败方的 failed 事件晚到：不得把 completed 覆盖为 failed（UpdateHistoryResult
-	// 因守卫命中 0 行，返回 not-found 类错误，调用方本就忽略）
-	_ = s.UpdateHistoryResult(ctx, 100, 1, HistoryStatusFailed, "boom", "")
+	// 真实复扫序列是 queued Upsert（被 completed 守卫挡住）后仍会发 skipped 终态。
+	if err := s.UpsertHistoryStart(ctx, &HistoryRecord{
+		TaskID: "t2", ChatID: 100, MessageID: 1, MediaType: "photo",
+		FileName: "a.jpg", FilePath: "/tmp/other.jpg", FileSize: 1, Status: HistoryStatusQueued,
+	}); err != nil {
+		t.Fatalf("UpsertHistoryStart(rescan) error = %v", err)
+	}
+	if err := s.UpdateHistoryResult(ctx, 100, 1, HistoryStatusSkipped, "already exists", "/tmp/other.jpg"); err != nil {
+		t.Fatalf("UpdateHistoryResult(skipped after completed) error = %v", err)
+	}
+	// 落败方的 failed 事件晚到，同样不得覆盖 completed。
+	if err := s.UpdateHistoryResult(ctx, 100, 1, HistoryStatusFailed, "boom", ""); err != nil {
+		t.Fatalf("UpdateHistoryResult(failed after completed) error = %v", err)
+	}
 
 	items, _, err := s.QueryHistory(ctx, &HistoryFilter{ChatID: 100})
 	if err != nil {
@@ -88,6 +99,9 @@ func TestUpdateHistoryResult_CompletedNotDowngradedToFailed(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Status != HistoryStatusCompleted {
 		t.Fatalf("completed row was downgraded: %+v", items)
+	}
+	if items[0].FilePath != "/tmp/a.jpg" || items[0].Reason != "" {
+		t.Fatalf("completed row metadata was overwritten: %+v", items[0])
 	}
 
 	// failed -> completed（重试成功）仍应允许

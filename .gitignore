@@ -42,3 +42,8 @@ tg-down.db-wal
 *.db
 *.db-shm
 *.db-wal
+
+# 前端构建（Vite）
+web/node_modules/
+internal/web/static/dist/*
+!internal/web/static/dist/.gitkeep

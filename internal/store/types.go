@@ -4,26 +4,29 @@ import "time"
 
 // TaskRow 表示 tasks 表中的一行下载任务记录
 type TaskRow struct {
-	ID             string
-	Kind           string
-	ChatID         int64
-	ChatTitle      string
-	Status         string
-	CreatedAt      time.Time
-	StartedAt      *time.Time
-	FinishedAt     *time.Time
-	Error          string
-	Total          int
-	Downloaded     int
-	Failed         int
-	Skipped        int
-	TotalSize      int64
-	DownloadedSize int64
-	ExpectedTotal  int64
-	ScanCursor     int64  // 历史扫描游标（最后已扫描页的最旧 message_id），0 = 从最新开始
-	Attempts       int    // 自动重试已消耗的次数
-	Filters        string // 任务级过滤器 JSON（downloader.HistoryFilters），空 = 不过滤
-	MessageID      int64  // 单消息下载任务的目标消息 id，0 = 整聊天历史任务
+	ID              string
+	Kind            string
+	ChatID          int64
+	ChatTitle       string
+	Status          string
+	CreatedAt       time.Time
+	StartedAt       *time.Time
+	FinishedAt      *time.Time
+	Error           string
+	Total           int
+	Downloaded      int
+	Failed          int
+	Skipped         int
+	TotalSize       int64
+	DownloadedSize  int64
+	ExpectedTotal   int64
+	ScanCursor      int64  // 历史扫描游标（最后已扫描页的最旧 message_id），0 = 从最新开始
+	Attempts        int    // 自动重试已消耗的次数
+	Filters         string // 任务级过滤器 JSON（downloader.HistoryFilters），空 = 不过滤
+	MessageID       int64  // 单消息下载任务的目标消息 id，0 = 整聊天历史任务
+	StopAtMessageID int64  // 定时增量扫描下界，0 = 不限制
+	ScheduleID      string // 触发该任务的定时计划 id，空 = 非定时任务
+	RetryFailedOnly bool   // 本轮只补下失败文件，不再扫描历史
 }
 
 // 任务状态常量，取值与 internal/queue 的 Status 保持一致（queue 为唯一词汇源）
@@ -31,6 +34,7 @@ const (
 	TaskStatusQueued    = "queued"
 	TaskStatusRunning   = "running"
 	TaskStatusCompleted = "completed"
+	TaskStatusPartial   = "partial"
 	TaskStatusFailed    = "failed"
 	TaskStatusCanceled  = "canceled"
 )
@@ -53,10 +57,16 @@ type HistoryRecord struct {
 	FinishedAt *time.Time
 	UniqueID   string // TDLib remote file unique_id，跨聊天稳定，用于内容级去重
 	AlbumID    int64  // Telegram 相册 id（media_album_id），0 = 不属于相册
+	ThumbPath  string // 缩略图缓存文件路径（.thumbs/<unique_id>.jpg），无缩略图为空
+	Minithumb  []byte // TDLib 随消息免费返回的极小 JPEG（约 40x40），画廊的即时占位图
 }
 
 // 下载历史状态常量，取值与 downloader.RecordStatus 保持一致
 const (
+	// HistoryStatusQueued 是媒体入队后的初始状态，终态到来前一直停留在此。
+	HistoryStatusQueued = "queued"
+	// HistoryStatusDownloading 是 v2.x 写入的在途状态，现已不再产生，
+	// 仅为清扫旧库中的遗留行而保留。
 	HistoryStatusDownloading = "downloading"
 	HistoryStatusCompleted   = "completed"
 	HistoryStatusFailed      = "failed"

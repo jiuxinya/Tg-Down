@@ -29,19 +29,23 @@
 ### 方式一：Docker（推荐）
 
 ```bash
+TOKEN="$(openssl rand -hex 32)"
 docker run -d --name tg-down \
   -p 8080:8080 \
-  -e TG_DOWN_WEB_TOKEN=change-me \
+  -e TG_DOWN_WEB_TOKEN="$TOKEN" \
   -e PUID=1000 -e PGID=1000 -e TZ=Asia/Shanghai \
   -v $PWD/downloads:/downloads -v $PWD/sessions:/sessions -v $PWD/data:/data \
   ghcr.io/heartcoolman/tg-down:latest
 ```
 
-浏览器打开 `http://<主机>:8080?token=change-me`，网页内完成 Telegram 登录即可使用。
+浏览器打开 `http://<主机>:8080?token=<上面生成的 TOKEN>`，网页内完成 Telegram 登录即可使用。
 
-- 镜像为多架构（amd64 / arm64），纯环境变量配置，凭据可留空由网页端填写；
-- `TG_DOWN_WEB_TOKEN` **必填**：绑定非回环地址时强制鉴权，缺失将拒绝启动；
-- 数据卷：`/downloads`（下载文件）、`/sessions`（Telegram 会话）、`/data`（任务数据库）。
+- 镜像为多架构（amd64 / arm64），凭据可留空由网页端填写；网页凭据以 0600 权限保存在
+  `/data/config.yaml`，只要保留 `/data` 卷，重建或重启容器后无需重新填写；
+- `TG_DOWN_WEB_TOKEN` **必填**：绑定非回环地址时强制鉴权，至少 16 个字符；
+- 数据卷：`/downloads`（下载文件）、`/sessions`（Telegram 会话）、`/data`（任务数据库和配置）；
+- 主机无法直连 Telegram 时，追加 `-e TG_PROXY="socks5://192.168.1.10:7890"`（或 `http://...`）经代理连接，
+  否则会一直停在「正在连接 Telegram」。
 
 ### 方式二：飞牛OS (fnOS)
 
@@ -72,14 +76,14 @@ tar -xzf tg-down-linux-amd64.tar.gz && cd tg-down-linux-amd64
 
 ### 方式四：源码构建
 
-依赖：Go 1.25+、cmake、gperf、OpenSSL（macOS：`brew install cmake gperf openssl@3`；
+依赖：Go 1.25.12+、cmake、gperf、OpenSSL（macOS：`brew install cmake gperf openssl@3`；
 Linux：`apt install cmake gperf libssl-dev zlib1g-dev g++`）。
 
 ```bash
 git clone https://github.com/Heartcoolman/Tg-Down.git && cd Tg-Down
 make tdlib    # 首次必需：构建安装 TDLib 到 ~/.tdlib，约 30-60 分钟
 make build    # 编译（自动设置 CGo 环境与版本号）
-cp config.yaml.example config.yaml   # 填入 API 信息
+install -m 600 config.yaml.example config.yaml   # 填入 API 信息
 ./tg-down
 ```
 
@@ -103,8 +107,11 @@ cp config.yaml.example config.yaml   # 填入 API 信息
 - **设置页**：分类存储开关、媒体并发数、登出。
 
 非回环监听时所有 API 需带令牌：`Authorization: Bearer <token>` 或 `?token=<token>`
-（页面会自动记忆 URL 中的 token）。反向代理场景用 `TG_DOWN_WEB_ALLOWED_HOSTS`
-配置允许的 Host（逗号分隔）。
+（页面会自动把 URL 中的 token 换成 HttpOnly Cookie）。反向代理场景用
+`TG_DOWN_WEB_ALLOWED_HOSTS` 配置允许的 Host（逗号分隔），并设置
+`TG_DOWN_WEB_TRUST_PROXY=1` 才会信任代理传入的 HTTPS 协议。启用代理 Host 后，即使后端只监听
+`127.0.0.1`，也必须设置至少 16 个字符的令牌。只有代理能访问后端端口时才能开启
+`TG_DOWN_WEB_TRUST_PROXY`；若代理把 Host 改写成回环地址，程序无法自动判断公网入口，仍须主动设置令牌。
 
 ### CLI 模式
 
@@ -135,12 +142,14 @@ notify:
 | `api.id` | `API_ID` | Telegram API ID | - |
 | `api.hash` | `API_HASH` | Telegram API Hash | - |
 | `api.phone` | `PHONE` | 手机号（国际格式） | - |
+| `telegram.proxy` | `TG_PROXY` | Telegram 连接代理（见下「代理」）；留空依次回退 `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`；`direct`/`off`/`none` 强制直连 | 空（直连） |
 | `download.path` | `DOWNLOAD_PATH` | 下载根目录 | `./downloads` |
 | `download.max_concurrent` | `MAX_CONCURRENT_DOWNLOADS` | 同时下载的文件数 | `5` |
 | `download.batch_size` | `BATCH_SIZE` | 每批拉取的历史消息数 | `100` |
 | `download.partition_size` | `PARTITION_SIZE` | 历史扫描在途媒体上限 | `100` |
 | `download.save_metadata` | `SAVE_METADATA` | 写 `<文件>.json` 元数据 sidecar | `false` |
 | `download.disable_classify_by_type` | - | 关闭按类型归档 | `false` |
+| `download.path_template` | - | 落盘路径模板（见下） | `chat_{chat_id}/{type}/{album}/{name}` |
 | `queue.max_concurrent_tasks` | `MAX_CONCURRENT_TASKS` | 并行历史任务数（监控不占额） | `1` |
 | `queue.auto_retry` | `AUTO_RETRY` | 任务失败自动重试次数（0 关闭） | `2` |
 | `retry.max_retries` | `MAX_RETRIES` | 单文件网络重试次数 | `3` |
@@ -155,12 +164,36 @@ Web / 容器专用环境变量：
 
 | 环境变量 | 说明 |
 |----------|------|
-| `TG_DOWN_WEB_TOKEN` | Web 访问令牌；绑定非回环地址时必填 |
+| `TG_DOWN_WEB_TOKEN` | Web 访问令牌；非回环监听或配置代理 Host 时必填，至少 16 个字符 |
 | `TG_DOWN_WEB_ALLOWED_HOSTS` | 额外允许的 Host（反向代理域名，逗号分隔） |
-| `TG_DOWN_NO_CONFIG_WRITE` | 非空时禁止写回 config.yaml（容器默认开启） |
+| `TG_DOWN_WEB_TRUST_PROXY` | `1` 时信任 `X-Forwarded-Proto`；仅用于无法绕过的可信代理 |
+| `TG_DOWN_NO_CONFIG_WRITE` | 非空时禁止写回 config.yaml（只适合完全由环境变量管理凭据的部署） |
 | `PUID` / `PGID` / `TZ` | 容器内运行用户 / 组 / 时区 |
 
+### 代理
+
+TDLib 不读 `HTTP_PROXY`/`HTTPS_PROXY` 等环境变量。服务器所在网络无法直连 Telegram 时，
+不配代理会一直卡在「正在连接 Telegram」（30 秒后日志会提示）。
+
+```yaml
+# config.yaml
+telegram:
+  proxy: "socks5://127.0.0.1:1080"   # 带认证: socks5://user:pass@host:port
+```
+
+或用环境变量（容器部署更方便）：`TG_PROXY`，或通用的 `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`
+（按此顺序取第一个非空值）。支持三种形式：
+
+- `socks5://[user:pass@]host:port`（`socks`、`socks5h` 同义）
+- `http://[user:pass@]host:port` —— HTTP CONNECT 透明转发（Clash/V2Ray 等混合端口即可）
+- `mtproto://secret@host:port`
+
+特殊值 `direct` / `off` / `none` 表示强制直连——当环境里已存在通用代理变量、
+但希望 Telegram 流量直连时使用。
+
 ### 文件组织
+
+默认布局（等价于模板 `chat_{chat_id}/{type}/{album}/{name}`）：
 
 ```
 downloads/
@@ -173,6 +206,33 @@ downloads/
     └── video/
         ├── video_4.mp4
         └── video_4.mp4.json  # save_metadata 开启时的元数据 sidecar
+```
+
+### 路径模板
+
+`download.path_template` 可自定义落盘路径。**默认值就是上面的既有布局**——不改它，升级后文件位置不变。
+
+| 占位符 | 展开为 |
+|--------|--------|
+| `{chat_id}` | 聊天数字 ID |
+| `{chat_title}` | 聊天标题（缺失时退回 `chat_<id>`） |
+| `{type}` | 媒体类型目录；关闭分类归档时该层级消失 |
+| `{album}` | `album_<id>`；非相册消息时该层级消失 |
+| `{date}` | 消息日期 `2024-03-05` |
+| `{msg_id}` | 消息 ID |
+| `{sender}` | 发送者 ID（未知为 `unknown`） |
+| `{name}` | 文件名（含扩展名，已带消息 ID 前缀） |
+| `{ext}` | 扩展名（含点） |
+
+展开为空的路径段会被丢弃，因此 `{type}` / `{album}` 能自然地"消失"。
+
+模板**必须包含 `{chat_id}`，并至少包含 `{name}` 或 `{msg_id}`**：前者隔离不同聊天，后者隔离
+同一聊天中的不同消息。缺少任一层都会让文件互相覆盖，或被当成“已下载”而跳过。非法模板会被忽略并回退到默认布局。
+
+```yaml
+download:
+  # 按 ID、标题和日期归档：downloads/123456/我的频道/2024-03-05/42_video.mp4
+  path_template: "{chat_id}/{chat_title}/{date}/{name}"
 ```
 
 ## 开发
@@ -208,14 +268,30 @@ CI/CD：push/PR 触发构建测试与 lint；发布由维护者手动打 `v*` ta
 | 问题 | 处理 |
 |------|------|
 | 认证失败 | 核对 `api_id` / `api_hash` / 手机号（国际格式，含 `+`） |
+| 一直卡在「正在连接 Telegram」 | 网络无法直连 Telegram，配置代理即可：`telegram.proxy` 或环境变量 `TG_PROXY` / `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`（详见「配置参考 → 代理」） |
 | Web 端 401 | URL 加 `?token=<TG_DOWN_WEB_TOKEN>` |
 | 容器启动即退出 | 未设置 `TG_DOWN_WEB_TOKEN`（绑定 0.0.0.0 时必填） |
-| Linux 报 GLIBC 版本错误 | 使用 v2.0.0+ 的发布包（glibc ≥ 2.29 即可）或 Docker 镜像 |
+| Linux 报 GLIBC 版本错误 | 使用 v2.0.0+ 的发布包（glibc ≥ 2.31 即可）或 Docker 镜像 |
 | macOS 报 openssl 缺失 | `brew install openssl@3` |
 | 需要重新登录 | `./tg-down --clear-session` |
 | TDLib 构建失败 | 确认 cmake/gperf/libssl-dev 已安装；内存 < 8GB 时 `JOBS=2 make tdlib` |
 
 ## 更新日志
+
+### v3.0.0 (2026-08-22)
+
+- 🔌 **连接代理**：新增 `TG_PROXY` 环境变量与 `telegram.proxy` 配置（socks5 / http CONNECT / mtproto）；
+  未显式配置时自动回退 `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`——容器代理部署不再卡死在
+  「正在连接 Telegram」（#49）。连接停滞 30s 起循环输出排查提示；代理配置非法时启动即报错
+- 🖼️ **媒体画廊**：缩略图预览、相册分组、单个媒体暂停/恢复，历史文件在线查看
+- 🧩 **管理台重构**：Vite + Preact 重写前端（任务/画廊/历史/定时/日志/设置分页），补齐安全响应头
+- 📝 **路径模板**：`download.path_template` 自定义落盘布局（默认保持 v2 布局，老文件不会重下）
+- 🎗️ **新媒体类型**：sticker、video note；统一媒体类型注册表
+- 💬 **聊天导出**：HTML 归档（类似 Telegram Desktop export）
+- 🪟 **Windows 支持**：新增 windows-amd64 发布包（MinGW-w64 构建）
+- 🛡️ **可靠性**：单文件失败不再被静默吞掉（任务新增 `partial` 终态）、FLOOD_WAIT 按服务端
+  `retry_after` 精确退避、扫描页级重试等修复；SQLite schema 自动迁移至 v3
+- ⚠️ **破坏性变更**：前端构建引入 Node/npm（贡献者需先 `npm ci`）；SQLite 库升级后不兼容 v2.x 之前
 
 ### v2.0.0 (2026-07-08)
 
@@ -225,7 +301,7 @@ CI/CD：push/PR 触发构建测试与 lint；发布由维护者手动打 `v*` ta
 - 🔗 **t.me 链接下载**：链接 / @用户名 直接下载，消息链接精确到单条
 - 🖼️ **相册聚合**（`album_<id>` 子目录）与 **元数据 sidecar**（`download.save_metadata`）
 - ⏰ **定时下载** 与 📣 **完成通知**（Saved Messages / webhook）
-- 🐳 **Docker 多架构镜像**（GHCR，amd64/arm64，PUID/PGID/纯环境变量配置）+ 飞牛OS 部署模板
+- 🐳 **Docker 多架构镜像**（GHCR，amd64/arm64，PUID/PGID、持久化网页凭据）+ 飞牛OS 部署模板
 - 🛠️ **Linux 发布包修复**：debian:11 构建（glibc ≥ 2.29 可运行，修复 #32），OpenSSL 捆绑
 - 🔢 **版本注入**：`--version` / 启动横幅 / Web 页脚
 - ⚠️ **破坏性变更**：移除配置 `download.chunk_size` / `download.max_workers` / `rate_limit.*`

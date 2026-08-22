@@ -17,6 +17,10 @@ type ScheduleRow struct {
 	Enabled     bool       `json:"enabled"`
 	LastRun     *time.Time `json:"last_run,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
+	// LastMaxID 是上次扫描见过的最新消息 id：下次触发只扫比它更新的消息。
+	// 没有它的话，每次定时触发都会从最新消息重扫整条历史——百万条消息的频道每 10 分钟
+	// 重扫一遍，纯属徒劳。
+	LastMaxID int64 `json:"last_max_id,omitempty"`
 }
 
 // CreateSchedule 插入一条定时计划
@@ -40,7 +44,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 //nolint:dupl // 与 ListTasks 结构同形但行类型/扫描器不同，泛型化收益低于可读性损失
 func (s *Store) ListSchedules(ctx context.Context) ([]*ScheduleRow, error) {
 	const q = `
-SELECT id, chat_id, chat_title, interval_min, filters, enabled, last_run, created_at
+SELECT id, chat_id, chat_title, interval_min, filters, enabled, last_run, created_at, last_max_id
 FROM schedules ORDER BY created_at DESC`
 
 	rows, err := s.db.QueryContext(ctx, q)
@@ -81,6 +85,19 @@ func (s *Store) SetScheduleEnabled(ctx context.Context, id string, enabled bool)
 	return checkRowsAffected(res, "定时计划", id)
 }
 
+// UpdateScheduleLastMaxID 推进定时计划的增量扫描水位（只增不减，避免回退导致重复扫描）
+func (s *Store) UpdateScheduleLastMaxID(ctx context.Context, id string, maxID int64) error {
+	if maxID <= 0 {
+		return nil
+	}
+	_, err := s.execContext(ctx,
+		`UPDATE schedules SET last_max_id = ? WHERE id = ? AND last_max_id < ?`, maxID, id, maxID)
+	if err != nil {
+		return fmt.Errorf("更新定时计划扫描水位失败: %w", err)
+	}
+	return nil
+}
+
 // TouchScheduleLastRun 记录定时计划的最近触发时间
 func (s *Store) TouchScheduleLastRun(ctx context.Context, id string, at time.Time) error {
 	res, err := s.execContext(ctx, `UPDATE schedules SET last_run = ? WHERE id = ?`, at.Unix(), id)
@@ -97,7 +114,8 @@ func scanScheduleRow(row scanner) (*ScheduleRow, error) {
 		lastRun            sql.NullInt64
 		createdAt          int64
 	)
-	if err := row.Scan(&r.ID, &r.ChatID, &chatTitle, &r.IntervalMin, &filters, &r.Enabled, &lastRun, &createdAt); err != nil {
+	if err := row.Scan(&r.ID, &r.ChatID, &chatTitle, &r.IntervalMin, &filters, &r.Enabled,
+		&lastRun, &createdAt, &r.LastMaxID); err != nil {
 		return nil, err
 	}
 	r.ChatTitle = chatTitle.String

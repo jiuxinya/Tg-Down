@@ -93,9 +93,19 @@ func (l *Logger) output(minLevel LogLevel, level, msg string, args ...interface{
 	if l.level > minLevel {
 		return
 	}
-	formatted := fmt.Sprintf(msg, args...)
+	formatted := expand(msg, args...)
 	fmt.Println(l.formatMessage(level, formatted))
 	l.emit(level, formatted)
+}
+
+// expand 仅在带参数时做格式化。无参数时 msg 是现成的消息而非格式串——
+// 再过一遍 Sprintf 会把其中的 % 当动词吃掉（Telegram 的文件名/caption 里 % 很常见，
+// "100% done" 会被打成 "100%!d(MISSING)one"）。
+func expand(msg string, args ...interface{}) string {
+	if len(args) == 0 {
+		return msg
+	}
+	return fmt.Sprintf(msg, args...)
 }
 
 // Debug 调试日志
@@ -120,7 +130,7 @@ func (l *Logger) Error(msg string, args ...interface{}) {
 
 // Fatal 致命错误日志
 func (l *Logger) Fatal(msg string, args ...interface{}) {
-	formatted := fmt.Sprintf(msg, args...)
+	formatted := expand(msg, args...)
 	fmt.Println(l.formatMessage("FATAL", formatted))
 	l.emit("FATAL", formatted)
 	os.Exit(ExitCodeFatal)
