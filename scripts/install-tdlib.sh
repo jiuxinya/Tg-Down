@@ -77,13 +77,15 @@ git checkout -f "$TDLIB_COMMIT"
 
 case "$(uname -s)" in
   MINGW* | MSYS*)
-    # MinGW 下的 tl-parser 编译缺陷：tlc.c 在 _WIN32 下不包含 <unistd.h>，改经
-    # tl-parser.h → wgetopt.h 拿 getopt 声明；而 wgetopt.h 只认 glibc 的
-    # __GNU_LIBRARY__，MinGW 未定义它，落到旧式无参原型 `extern int getopt ();`，
-    # tlc.c:115 的三参调用直接报 "too many arguments to function 'getopt'"。
-    # MinGW 同样提供带完整原型的 <unistd.h>（两种声明在 C 里兼容），补上包含即可。
-    sed -i 's/^#ifndef _WIN32$/#if !defined(_WIN32) || defined(__MINGW32__)/' \
-      td/generate/tl-parser/tlc.c
+    # MinGW 下的 tl-parser 编译缺陷：tl-parser.h 在 _WIN32 下经 wgetopt.h 声明 getopt，
+    # 而 wgetopt.h 只认 glibc 的 __GNU_LIBRARY__，MinGW 未定义该宏，落到旧式无参原型
+    # `extern int getopt ();`，tlc.c:115 的三参调用报 "too many arguments to function
+    # 'getopt'"。wgetopt.c 的实际定义本就是三参（int, char *const *, const char *），
+    # 把头文件声明修成一致原型即可——不改任何实现，MSVC 路径不受影响。
+    # （注意不能改成给 tlc.c 补 <unistd.h>：那会与先前的无参声明冲突，
+    # 实测 MinGW gcc 报 conflicting types。）
+    sed -i 's/^extern int getopt ();$/extern int getopt (int argc, char *const *argv, const char *optstring);/' \
+      td/generate/tl-parser/wgetopt.h
     ;;
 esac
 
