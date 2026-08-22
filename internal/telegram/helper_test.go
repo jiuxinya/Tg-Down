@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -106,7 +107,8 @@ func TestCopyFileUsesUniqueTemporaryFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows 的 Chmod 只切换只读位，Stat 不回传 POSIX 权限，跳过断言
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Errorf("复制文件权限 = %o, want 600", info.Mode().Perm())
 	}
 }

@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -83,7 +84,7 @@ func TestWriteExportConcurrentCallsUseUniquePrivateFiles(t *testing.T) {
 				t.Errorf("导出文件不存在: %v", err)
 				continue
 			}
-			if info.Mode().Perm() != exportFilePerm {
+			if runtime.GOOS != "windows" && info.Mode().Perm() != exportFilePerm {
 				t.Errorf("%s 权限 = %o, want %o", path, info.Mode().Perm(), exportFilePerm)
 			}
 		}
