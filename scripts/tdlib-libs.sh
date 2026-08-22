@@ -21,7 +21,9 @@ TDLIB_LIBS="-ltdjson_static -ltdjson_private -ltdclient -ltdcore -ltde2e -ltdmtp
 # 其余平台用 -ldl。
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)
-    SYS_LIBS="-lstdc++ -lssl -lcrypto -lz -lm -lws2_32 -lcrypt32 -lgdi32 -ladvapi32 -luser32 -lbcrypt"
+    # -lpsapi：TDLib 的 Stat.cpp 用 GetProcessMemoryInfo 做内存统计（MinGW 下
+    # 该符号在 psapi 库，不在默认链接集里，缺了报 undefined reference）。
+    SYS_LIBS="-lstdc++ -lssl -lcrypto -lz -lm -lws2_32 -lcrypt32 -lgdi32 -ladvapi32 -luser32 -lbcrypt -lpsapi"
     ;;
   *)
     SYS_LIBS="-lstdc++ -lssl -lcrypto -ldl -lz -lm"
