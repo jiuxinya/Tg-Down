@@ -280,8 +280,14 @@ func TestOpenRestrictsPermissionsBeforeSchemaFailure(t *testing.T) {
 }
 
 func TestOpenSupportsSpecialCharactersInDatabasePath(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "data ?#%")
-	path := filepath.Join(dir, "store ?#%.db")
+	// URI 特殊字符在 DSN 里必须被正确转义。`?` 在 Windows 是非法文件名字符，
+	// 用 `% # 空格` 保持同等转义覆盖面。
+	special := " ?#%"
+	if runtime.GOOS == "windows" {
+		special = " %#"
+	}
+	dir := filepath.Join(t.TempDir(), "data "+special)
+	path := filepath.Join(dir, "store "+special+".db")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open(special path) error = %v", err)

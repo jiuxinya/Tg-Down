@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
@@ -589,7 +590,14 @@ func validateConfig(config *Config) error {
 
 // SaveConfig 保存配置到文件。设置 TG_DOWN_NO_CONFIG_WRITE 环境变量时跳过写入
 // （容器等纯环境变量部署场景，配置由 env 提供，不应写回 config.yaml）。
+// saveConfigMu 串行化并发 SaveConfig：unix 上 rename 原子替换让并发写"碰巧"安全
+// （last-write-wins），Windows 的 MoveFileEx 替换被占用目标会因共享冲突瞬时失败。
+// 单进程内加互斥锁即获得全平台确定性行为。
+var saveConfigMu sync.Mutex
+
 func (c *Config) SaveConfig(filename string) error {
+	saveConfigMu.Lock()
+	defer saveConfigMu.Unlock()
 	if os.Getenv("TG_DOWN_NO_CONFIG_WRITE") != "" {
 		fmt.Fprintln(os.Stderr, "[配置] TG_DOWN_NO_CONFIG_WRITE 已设置，跳过配置写回")
 		return nil

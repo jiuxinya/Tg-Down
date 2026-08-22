@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -764,7 +765,8 @@ func TestMetadataSidecarIsPrivateAndDoesNotFollowSymlink(t *testing.T) {
 	if info.Mode()&os.ModeSymlink != 0 {
 		t.Fatal("sidecar 仍是符号链接")
 	}
-	if info.Mode().Perm() != metadataFilePerm {
+	// Windows 的 Chmod 只切换只读位，Stat 不回传 POSIX 权限，跳过权限断言
+	if runtime.GOOS != "windows" && info.Mode().Perm() != metadataFilePerm {
 		t.Errorf("sidecar 权限 = %o, want %o", info.Mode().Perm(), metadataFilePerm)
 	}
 }

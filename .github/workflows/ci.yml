@@ -150,7 +150,9 @@ jobs:
         run: |
           {
             echo "CGO_ENABLED=1"
-            echo "CGO_CFLAGS=-I$TDLIB_PREFIX/include"
+            # TDJSON_STATIC_DEFINE：CMake 生成的导出头在 Windows 消费侧默认
+            # __declspec(dllimport)，静态库没有 __imp_* 符号会链接失败；置位后走空宏。
+            echo "CGO_CFLAGS=-I$TDLIB_PREFIX/include -DTDJSON_STATIC_DEFINE"
             echo "CGO_LDFLAGS=-L$TDLIB_PREFIX/lib $(bash scripts/tdlib-libs.sh --print)"
           } >> "$GITHUB_ENV"
 
