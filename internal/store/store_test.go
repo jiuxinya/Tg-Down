@@ -332,7 +332,12 @@ func TestSqliteDSNConvertsRelativePathToAbsoluteURI(t *testing.T) {
 	tmp := t.TempDir()
 	t.Chdir(tmp)
 	got := sqliteDSN("./data/tg-down.db")
-	want := "file://" + filepath.ToSlash(filepath.Join(tmp, "data", "tg-down.db")) +
+	// 期望值与 sqliteDSN 同构：Windows 盘符路径需补前导斜杠（file:///C:/...）
+	abs := filepath.ToSlash(filepath.Join(tmp, "data", "tg-down.db"))
+	if filepath.VolumeName(filepath.FromSlash(abs)) != "" {
+		abs = "/" + abs
+	}
+	want := "file://" + abs +
 		"?_pragma=busy_timeout%285000%29&_pragma=journal_mode%28WAL%29&_pragma=synchronous%28NORMAL%29"
 	if got != want {
 		t.Fatalf("sqliteDSN(relative) = %q, want %q", got, want)
