@@ -155,6 +155,60 @@ export interface Settings {
   download_path: string
   classify_by_type: boolean
   media_concurrency: DownloadSettings
+  save_metadata?: boolean
+  proxy?: string
+  task_concurrency?: number
+  auto_retry?: number
+  log_level?: string
+  notify_telegram_self?: boolean
+  notify_webhook_url?: string
+}
+
+export interface SettingsUpdate {
+  classify_by_type?: boolean
+  max_concurrent?: number
+  save_metadata?: boolean
+  proxy?: string | null
+  task_concurrency?: number
+  auto_retry?: number
+  log_level?: string
+  notify_telegram_self?: boolean
+  notify_webhook_url?: string | null
+}
+
+export interface SettingsUpdateResponse {
+  settings: Settings
+  notices?: string[]
+}
+
+// ---- 桌面壳（/desktop/api/*）----
+
+export interface DesktopInfo {
+  version: string
+  goos: string
+  goarch: string
+  app_dir: string
+  autostart: boolean
+  local: string
+}
+
+export interface RemoteInstance {
+  id: string
+  name: string
+  url: string
+  has_token: boolean
+}
+
+export interface InstancesResponse {
+  selected: string
+  instances: RemoteInstance[]
+}
+
+export interface TestResult {
+  ok: boolean
+  version?: string
+  state?: string
+  error?: string
 }
 
 export interface ExportResult {

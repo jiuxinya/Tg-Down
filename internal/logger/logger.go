@@ -41,28 +41,55 @@ type Logger struct {
 	logger *log.Logger
 	mu     sync.RWMutex
 	hook   func(level, msg string)
+	file   *fileSink
 }
 
 // New 创建新的日志记录器
 func New(level string) *Logger {
-	var logLevel LogLevel
-	switch strings.ToLower(level) {
-	case LevelDebug:
-		logLevel = DEBUG
-	case LevelInfo:
-		logLevel = INFO
-	case LevelWarn:
-		logLevel = WARN
-	case LevelError:
-		logLevel = ERROR
-	default:
-		logLevel = INFO
-	}
-
 	return &Logger{
-		level:  logLevel,
+		level:  parseLevel(level),
 		logger: log.New(os.Stdout, "", 0),
 	}
+}
+
+// parseLevel 解析级别字符串，无法识别时回退 INFO。
+// 不做空白裁剪：与既有 New() 行为一致；调用方（设置页）自行 trim 后再传入。
+func parseLevel(level string) LogLevel {
+	switch strings.ToLower(level) {
+	case LevelDebug:
+		return DEBUG
+	case LevelInfo:
+		return INFO
+	case LevelWarn:
+		return WARN
+	case LevelError:
+		return ERROR
+	default:
+		return INFO
+	}
+}
+
+// SetLevel 运行时调整日志级别（设置页热更新用）
+func (l *Logger) SetLevel(level string) {
+	l.mu.Lock()
+	l.level = parseLevel(level)
+	l.mu.Unlock()
+}
+
+// SetFileSink 让日志同时写入文件（按大小轮转）。重复调用会关闭旧文件并切换到新路径。
+func (l *Logger) SetFileSink(path string, maxBytes int64, keep int) error {
+	sink, err := newFileSink(path, maxBytes, keep)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	old := l.file
+	l.file = sink
+	l.mu.Unlock()
+	if old != nil {
+		old.close()
+	}
+	return nil
 }
 
 // SetHook 注册日志回调（如 Web 端 SSE 广播）。回调必须非阻塞且不得再调用本 logger。
@@ -94,8 +121,15 @@ func (l *Logger) output(minLevel LogLevel, level, msg string, args ...interface{
 		return
 	}
 	formatted := expand(msg, args...)
-	fmt.Println(l.formatMessage(level, formatted))
+	line := l.formatMessage(level, formatted)
+	fmt.Println(line)
 	l.emit(level, formatted)
+	l.mu.RLock()
+	sink := l.file
+	l.mu.RUnlock()
+	if sink != nil {
+		sink.writeLine(line)
+	}
 }
 
 // expand 仅在带参数时做格式化。无参数时 msg 是现成的消息而非格式串——

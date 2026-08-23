@@ -67,6 +67,7 @@ nav.tabs button.on { background: var(--card); color: var(--text); box-shadow: 0 
 }
 
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.col { display: flex; flex-direction: column; }
 .meta { color: var(--muted); font-size: 13px; }
 .mono { font-variant-numeric: tabular-nums; }
 

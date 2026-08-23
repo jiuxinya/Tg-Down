@@ -90,6 +90,8 @@ type Client interface {
 	DownloadPath() string
 	ClassifyByType() bool
 	SetClassifyByType(on bool) error
+	SaveMetadata() bool
+	SetSaveMetadata(v bool) error
 	DownloadConcurrency() int
 	SetDownloadConcurrency(n int) error
 	ActiveDownloadCount() int

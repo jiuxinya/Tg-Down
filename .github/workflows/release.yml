@@ -207,9 +207,170 @@ jobs:
           name: tg-down-windows-amd64
           path: tg-down-windows-amd64.zip
 
+  # 桌面客户端（Wails 壳，内嵌引擎）。与服务器版同源构建，但产物为安装包/便携包。
+  # Linux 桌面用 ubuntu-24.04 + webkit2gtk-4.1（wails 的 webkit2_41 标签），
+  # glibc 基线比服务器版高（Ubuntu 22.04+/Debian 12+），在发布说明中已注明。
+  build-desktop-linux:
+    name: Desktop linux-amd64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config zlib1g-dev libssl-dev
+
+      - name: Install nfpm
+        run: |
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_x86_64.tar.gz | tar -xz -C /tmp nfpm
+          sudo install -m 755 /tmp/nfpm /usr/local/bin/nfpm
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Setup TDLib
+        uses: ./.github/actions/setup-tdlib
+
+      - name: Build desktop package
+        run: |
+          export CGO_LDFLAGS="-L$HOME/.tdlib/lib $(bash scripts/tdlib-libs.sh --print)"
+          go build -tags "desktop,production,webkit2_41" -buildvcs=false \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o dist/desktop/tg-down-desktop ./cmd/desktop
+          bash scripts/package-desktop.sh linux amd64 "${GITHUB_REF_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: tg-down-desktop-linux-amd64
+          path: |
+            dist/desktop/tg-down-desktop-linux-amd64.deb
+            dist/desktop/tg-down-desktop-linux-amd64.rpm
+            dist/desktop/tg-down-desktop-linux-amd64.tar.gz
+
+  build-desktop-macos:
+    name: Desktop darwin-arm64
+    runs-on: macos-14
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Setup TDLib
+        uses: ./.github/actions/setup-tdlib
+
+      - name: Build desktop package
+        run: |
+          export CGO_LDFLAGS="-L$HOME/.tdlib/lib $(bash scripts/tdlib-libs.sh --print) -framework UniformTypeIdentifiers"
+          go build -tags "desktop,production" -buildvcs=false \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o dist/desktop/tg-down-desktop ./cmd/desktop
+          bash scripts/package-desktop.sh darwin arm64 "${GITHUB_REF_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: tg-down-desktop-darwin-arm64
+          path: dist/desktop/tg-down-desktop-darwin-arm64.dmg
+
+  build-desktop-windows:
+    name: Desktop windows-amd64
+    runs-on: windows-latest
+    env:
+      TDLIB_PREFIX: C:/tdlib
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up MSYS2 (MinGW-w64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: false
+          install: git make zip
+          pacboy: >-
+            toolchain:p
+            cmake:p
+            gperf:p
+            openssl:p
+            zlib:p
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Cache TDLib
+        id: tdlib-cache
+        uses: actions/cache@v4
+        with:
+          path: C:/tdlib
+          key: tdlib-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-tdlib.sh') }}
+
+      - name: Build TDLib (cache miss)
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        run: bash scripts/install-tdlib.sh
+
+      - name: Export CGO env
+        run: |
+          {
+            echo "CGO_ENABLED=1"
+            echo "CGO_CFLAGS=-I$TDLIB_PREFIX/include -DTDJSON_STATIC_DEFINE"
+            echo "CGO_LDFLAGS=-L$TDLIB_PREFIX/lib $(bash scripts/tdlib-libs.sh --print)"
+          } >> "$GITHUB_ENV"
+
+      - name: Build desktop package
+        shell: msys2 {0}
+        run: |
+          go build -tags "desktop,production" -buildvcs=false \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o dist/desktop/tg-down-desktop.exe ./cmd/desktop
+          bash scripts/package-desktop.sh windows amd64 "${GITHUB_REF_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: tg-down-desktop-windows-amd64
+          path: |
+            dist/desktop/tg-down-desktop-windows-amd64.zip
+            dist/desktop/tg-down-desktop-windows-amd64-setup.exe
+
   release:
     name: Create Release
-    needs: [build, build-windows]
+    needs: [build, build-windows, build-desktop-linux, build-desktop-macos, build-desktop-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -233,6 +394,10 @@ jobs:
           files: |
             artifacts/tg-down-*.tar.gz
             artifacts/tg-down-*.zip
+            artifacts/tg-down-desktop-*.deb
+            artifacts/tg-down-desktop-*.rpm
+            artifacts/tg-down-desktop-*.dmg
+            artifacts/tg-down-desktop-*-setup.exe
             artifacts/checksums.txt
           generate_release_notes: true
           draft: false
@@ -247,6 +412,17 @@ jobs:
             - **Windows x86_64**: `tg-down-windows-amd64.zip`——MinGW-w64 构建，解压即用
             - **Docker（推荐，含 arm64）**: `docker pull ghcr.io/heartcoolman/tg-down:latest`，
               飞牛 fnOS 等 NAS 部署见 README「飞牛OS (fnOS) 部署」
+
+            ## 🖥 桌面客户端
+
+            - **macOS (Apple Silicon)**: `tg-down-desktop-darwin-arm64.dmg`——未签名，
+              首次打开需右键 → 打开绕过 Gatekeeper
+            - **Windows x86_64**: 便携 zip 或 `-setup.exe` 安装包（内置 WebView2 引导）
+            - **Linux x86_64**: deb / rpm——依赖 webkit2gtk-4.1，Ubuntu 22.04+/Debian 12+；
+              另有便携 tar.gz
+
+            > 桌面客户端内嵌完整下载引擎；Docker 用户可继续使用网页端，
+            > 桌面端「实例…」可添加远程 Docker 实例统一管理。
 
             > TDLib 已静态链入二进制。其余平台/架构因 CGo 无法交叉编译，
             > 可在对应平台自行 `make tdlib && make build` 构建。

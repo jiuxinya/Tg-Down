@@ -46,6 +46,7 @@
 **通知与部署**
 
 - 📣 **完成通知**：任务完成/失败推送到 Saved Messages 或 webhook
+- 🖥️ **桌面客户端**：Windows / macOS / Linux 桌面应用，内嵌引擎 + 远程实例统一管理（见 [docs/desktop.md](docs/desktop.md)）
 - 🐳 **多种部署方式**：单二进制、多架构 Docker 镜像（amd64/arm64）、飞牛OS Compose 模板、Linux/macOS/Windows 预编译包
 
 ---
@@ -91,11 +92,14 @@ docker run -d --name tg-down \
 3. 部署后访问 `http://<NAS地址>:8080?token=<令牌>` 完成网页登录；
 4. 下载文件属主为 `PUID:PGID`，可直接经 SMB / 相册应用访问。
 
+### 桌面客户端
+
+不想用命令行或 Docker？桌面客户端（Windows / macOS / Linux）内嵌完整引擎，安装即用，
+并支持把多台 Docker 部署接入同一窗口统一管理。下载与构建见 **[docs/desktop.md](docs/desktop.md)**。
+
 ### 预编译包
 
-从 [Releases](https://github.com/Heartcoolman/Tg-Down/releases) 下载对应平台压缩包：
-
-| 平台 | 包名 | 说明 |
+从 [Releases](https://github.com/Heartcoolman/Tg-Down/releases) 下载对应平台压缩包：| 平台 | 包名 | 说明 |
 |------|------|------|
 | Linux x86_64 | `tg-down-linux-amd64.tar.gz` | 自包含（OpenSSL 已捆绑于 `lib/`），glibc ≥ 2.31 即可运行（Debian 11+ / Ubuntu 20.04+） |
 | macOS Apple Silicon | `tg-down-darwin-arm64.tar.gz` | 需 `brew install openssl@3` |
@@ -338,6 +342,20 @@ CI/CD：push/PR 触发构建测试与 lint；发布由维护者手动打 `v*` ta
 ---
 
 ## 📜 更新日志
+
+### v3.1.0 (2026-08-23)
+
+- 🖥️ **桌面客户端**：新增 Windows / macOS / Linux 三平台桌面应用（Wails 壳），内嵌完整下载引擎
+  （TDLib + 任务队列 + Web 管理台），安装即用；关闭即隐藏到托盘、开机自启、单实例锁、任务失败
+  系统通知、启动时检查更新（详见 [docs/desktop.md](docs/desktop.md)）
+- 🔗 **多实例管理**：桌面端可添加多台远程 Docker 实例（地址 + 访问令牌），同一窗口切换统一管理；
+  凭据仅存本机 `instances.json`（0600），经壳层反代注入，不暴露给界面层
+- ⚙️ **设置热更新**：设置页覆盖代理、并发、重试、元数据 sidecar、通知、日志级别等完整配置项，
+  可热应用的项立即生效并写回 `config.yaml`
+- 📜 **文件日志**：`log.file` / `LOG_FILE` 将日志落盘（10MB 轮转 ×3，桌面端默认开启）；
+  日志页支持按级别过滤与错误/警告快捷视图
+- 🧱 **引擎可嵌入**：`web.Server` 拆出 `Serve`（监听器注入）与 `UIHandler`（内嵌前端独立挂载），
+  供桌面壳等宿主程序复用同一套装配链
 
 ### v3.0.0 (2026-08-22)
 

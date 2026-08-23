@@ -122,6 +122,9 @@ type ChatConfig struct {
 // LogConfig 日志配置
 type LogConfig struct {
 	Level string `yaml:"level"`
+	// File 非空时日志同时写入该文件（按大小轮转，见 logger 包默认参数）。
+	// 留空仅输出到控制台；桌面客户端默认填入应用数据目录下的 logs/tg-down.log
+	File string `yaml:"file"`
 }
 
 // SessionConfig 会话配置
@@ -461,6 +464,9 @@ func loadChatConfig(config *Config) error {
 func loadLogConfig(config *Config) {
 	if logLevel := os.Getenv("LOG_LEVEL"); logLevel != "" {
 		config.Log.Level = logLevel
+	}
+	if logFile := os.Getenv("LOG_FILE"); logFile != "" {
+		config.Log.File = logFile
 	}
 }
 

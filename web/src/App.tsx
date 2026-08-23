@@ -3,11 +3,14 @@ import { APIError, api, authRedirecting, beginTokenBootstrap } from './api'
 import { Auth } from './components/Auth'
 import { Gallery } from './components/Gallery'
 import { History } from './components/History'
+import { InstanceBar } from './components/InstanceBar'
 import { Logs } from './components/Logs'
 import { Schedules } from './components/Schedules'
 import { SettingsPanel } from './components/Settings'
 import { Tasks } from './components/Tasks'
 import { CONNECTION_LABEL, fmtSize } from './format'
+import { LOCAL_INSTANCE, desktopApi, probeDesktop, selectedInstance } from './desktop'
+import type { DesktopInfo } from './types'
 import {
   connectEvents, loadChats, loadTasks, stateStore, toast, toastStore, useStore,
 } from './store'
@@ -33,6 +36,7 @@ export function App() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [accessDenied, setAccessDenied] = useState(false)
   const [eventNotice, setEventNotice] = useState('')
+  const [desktopInfo, setDesktopInfo] = useState<DesktopInfo | null>(null)
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem(THEME_KEY) || 'auto' } catch { return 'auto' }
   })
@@ -42,6 +46,10 @@ export function App() {
     else document.documentElement.setAttribute('data-theme', theme)
     try { localStorage.setItem(THEME_KEY, theme) } catch { /* 隐私模式，忽略 */ }
   }, [theme])
+
+  useEffect(() => {
+    void probeDesktop().then(setDesktopInfo)
+  }, [])
 
   useEffect(() => {
     if (authRedirecting) return
@@ -81,6 +89,7 @@ export function App() {
       <header class="top">
         <h1>Tg-Down</h1>
         <span class="meta mono">{snap?.version || ''}</span>
+        {desktopInfo && <span class="meta">桌面端</span>}
         <span class="grow" />
         {ready && (
           <nav class="tabs">
@@ -89,6 +98,7 @@ export function App() {
             ))}
           </nav>
         )}
+        <InstanceBar info={desktopInfo} />
         <select value={theme} onChange={(e) => setTheme(e.currentTarget.value)} title="主题">
           <option value="auto">跟随系统</option>
           <option value="light">浅色</option>
@@ -134,19 +144,30 @@ export function App() {
 
 function AccessTokenGate() {
   const [token, setToken] = useState('')
-  const submit = (e: Event) => {
+  const isRemote = selectedInstance() !== LOCAL_INSTANCE
+  const submit = async (e: Event) => {
     e.preventDefault()
     if (!token.trim()) { toast('访问令牌不能为空'); return }
+    if (isRemote) {
+      // 远程实例：把令牌交给壳层保存，由反代注入后续请求
+      try {
+        await desktopApi.updateInstance(selectedInstance(), { token: token.trim() })
+        location.reload()
+      } catch (err) {
+        toast((err as Error).message)
+      }
+      return
+    }
     beginTokenBootstrap(token.trim())
   }
 
   return (
-    <form class="card" onSubmit={submit}>
+    <form class="card" onSubmit={(e) => void submit(e)}>
       <h2 style="margin-top:0">访问鉴权</h2>
       <div class="row">
         <input
           type="password" autoComplete="off" autoFocus style="flex:1;min-width:220px"
-          placeholder="TG_DOWN_WEB_TOKEN" value={token}
+          placeholder={isRemote ? '远程实例的 TG_DOWN_WEB_TOKEN' : 'TG_DOWN_WEB_TOKEN'} value={token}
           onInput={(e) => setToken(e.currentTarget.value)}
         />
         <button class="accent">进入管理台</button>

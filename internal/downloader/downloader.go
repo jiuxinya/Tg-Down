@@ -299,6 +299,11 @@ func (d *Downloader) SetSaveMetadata(v bool) {
 	d.saveMetadata.Store(v)
 }
 
+// SaveMetadata 返回是否在下载完成后写元数据 sidecar
+func (d *Downloader) SaveMetadata() bool {
+	return d.saveMetadata.Load()
+}
+
 // SetMaxConcurrent updates the number of media files that may download at once.
 func (d *Downloader) SetMaxConcurrent(maxConcurrent int) {
 	d.limiter.setLimit(maxConcurrent)

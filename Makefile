@@ -1,6 +1,6 @@
 # Makefile for Telegram Media Downloader (TDLib engine)
 
-.PHONY: all build run test test-fast test-integration clean deps help install config tdlib dev web web-dev
+.PHONY: all build build-desktop package-desktop run test test-fast test-integration clean deps help install config tdlib dev web web-dev
 
 # TDLib 安装前缀（scripts/install-tdlib.sh 默认装到这里）
 TDLIB_PREFIX ?= $(HOME)/.tdlib
@@ -52,6 +52,25 @@ build: web
 	@go build -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd
 	@echo "编译完成！"
 
+# 桌面客户端（Wails 壳 + 内嵌引擎）。macOS 需补 UniformTypeIdentifiers 框架（拖放 API 的链接依赖）。
+# 必须带 desktop,production 标签，否则 wails.Run 运行时报 "will not build without the correct build tags"。
+DESKTOP_BIN := tg-down-desktop$(if $(IS_WINDOWS),.exe,)
+DESKTOP_TAGS := desktop,production
+
+build-desktop: web
+	@echo "正在编译桌面客户端 (CGo + TDLib + Wails, $(VERSION))..."
+	@CGO_LDFLAGS="$(CGO_LDFLAGS)$(if $(filter Darwin,$(UNAME_S)), -framework UniformTypeIdentifiers,)" \
+		go build -tags "$(DESKTOP_TAGS)" \
+		-ldflags "-s -w -X main.version=$(VERSION)" \
+		-o $(DESKTOP_BIN) ./cmd/desktop
+	@echo "桌面客户端编译完成：$(DESKTOP_BIN)"
+
+# 打包桌面发布产物（dmg / zip+NSIS / tar.gz+deb+rpm），见 scripts/package-desktop.sh
+package-desktop: build-desktop
+	@mkdir -p dist/desktop && cp $(DESKTOP_BIN) dist/desktop/
+	@bash scripts/package-desktop.sh \
+		$(shell go env GOOS) $(shell go env GOARCH) "$(VERSION)"
+
 # 运行程序
 run: build
 	@echo "正在运行程序..."
@@ -66,7 +85,8 @@ test:
 #
 # 包清单用 go list 求补集而不是手写：新加的包自动进车道；而一旦某个包意外 import 了
 # internal/telegram（把 CGo 依赖传染出去），这条车道会立刻编译失败——正是要守的边界。
-FAST_PKGS = $(shell go list ./... | grep -v -e '/cmd$$' -e '/internal/telegram$$')
+# cmd/desktop 同样被排除：它经 Wails 引擎链 import internal/telegram，属合法例外。
+FAST_PKGS = $(shell go list ./... | grep -v -e '/cmd$$' -e '/cmd/desktop$$' -e '/internal/telegram$$')
 
 test-fast: export CGO_CFLAGS =
 test-fast: export CGO_LDFLAGS =

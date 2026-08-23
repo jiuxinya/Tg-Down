@@ -47,3 +47,7 @@ tg-down.db-wal
 web/node_modules/
 internal/web/static/dist/*
 !internal/web/static/dist/.gitkeep
+
+# 桌面客户端打包产物
+dist/
+tg-down-desktop

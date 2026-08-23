@@ -811,6 +811,18 @@ func (c *Client) SetDownloadConcurrency(n int) error {
 	return c.SaveConfig()
 }
 
+// SaveMetadata 返回是否为下载完成的文件写元数据 sidecar
+func (c *Client) SaveMetadata() bool { return c.downloader.SaveMetadata() }
+
+// SetSaveMetadata 切换元数据 sidecar（对后续下载生效），并写回 config.yaml
+func (c *Client) SetSaveMetadata(v bool) error {
+	c.downloader.SetSaveMetadata(v)
+	c.credMu.Lock()
+	c.config.Download.SaveMetadata = v
+	c.credMu.Unlock()
+	return c.SaveConfig()
+}
+
 // SetScanProgressFunc 设置历史扫描进度回调；须在 Connect/任务运行前注册
 func (c *Client) SetScanProgressFunc(fn func(taskID string, scannedMessages, foundMedia, scanCursor int64)) {
 	c.scanProgressFunc = fn

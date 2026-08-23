@@ -1,7 +1,9 @@
 import type {
   Chat, DownloadSettings, ExportResult, HistoryFilters, HistoryPage, HistoryStatsResponse,
-  OKResponse, ResolvedTarget, Schedule, Settings, StateSnapshot, Task,
+  OKResponse, ResolvedTarget, Schedule, Settings, SettingsUpdate, SettingsUpdateResponse,
+  StateSnapshot, Task,
 } from './types'
+import { apiBase } from './desktop'
 
 const TOKEN_KEY = 'tg_down_token'
 const COOKIE_AUTH_MARKER = 'tg_down_web_cookie_auth=1'
@@ -62,11 +64,13 @@ export function beginTokenBootstrap(token: string) {
   location.replace(target.toString())
 }
 
-// Cookie 引导是主路径；查询参数只在未发现能力标记的旧版部署中使用。
-// <img>/<video>/EventSource 无法自定义请求头，因此旧版只能继续走查询参数。
+// withToken 附加当前实例的 API 基路径；本地令牌仅在直连部署（网页端）场景存在。
+// 桌面远程实例的令牌由壳层反代注入，不经过这里。
 export function withToken(path: string): string {
-  if (!authToken) return path
-  return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(authToken)
+  const base = apiBase()
+  const full = base + path
+  if (!authToken) return full
+  return full + (full.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(authToken)
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -92,44 +96,47 @@ const post = <T,>(path: string, body?: unknown) =>
   request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
 
 export const api = {
-  state: () => get<StateSnapshot>('/api/state'),
-  chats: () => get<Chat[]>('/api/chats'),
-  refreshChats: () => post<Chat[]>('/api/chats/refresh'),
-  settings: () => get<Settings>('/api/settings'),
-  setClassify: (v: boolean) => post<Settings>('/api/settings/classify', { classify_by_type: v }),
+  state: () => get<StateSnapshot>(withToken('/api/state')),
+  chats: () => get<Chat[]>(withToken('/api/chats')),
+  refreshChats: () => post<Chat[]>(withToken('/api/chats/refresh')),
+  settings: () => get<Settings>(withToken('/api/settings')),
+  updateSettings: (patch: SettingsUpdate) =>
+    post<SettingsUpdateResponse>(withToken('/api/settings'), patch),
+  setClassify: (v: boolean) => post<Settings>(withToken('/api/settings/classify'), { classify_by_type: v }),
 
   submitCredentials: (api_id: number, api_hash: string, phone: string) =>
-    post<OKResponse>('/api/auth/credentials', { api_id, api_hash, phone }),
-  submitCode: (code: string) => post<OKResponse>('/api/auth/code', { code }),
-  submitPassword: (password: string) => post<OKResponse>('/api/auth/password', { password }),
-  abortAuth: () => post<OKResponse>('/api/auth/abort'),
-  logout: () => post<OKResponse>('/api/auth/logout'),
+    post<OKResponse>(withToken('/api/auth/credentials'), { api_id, api_hash, phone }),
+  submitCode: (code: string) => post<OKResponse>(withToken('/api/auth/code'), { code }),
+  submitPassword: (password: string) => post<OKResponse>(withToken('/api/auth/password'), { password }),
+  abortAuth: () => post<OKResponse>(withToken('/api/auth/abort')),
+  logout: () => post<OKResponse>(withToken('/api/auth/logout')),
 
-  tasks: () => get<Task[]>('/api/tasks'),
+  tasks: () => get<Task[]>(withToken('/api/tasks')),
   createTask: (body: { kind: string; chat_id: number; chat_title?: string; filters?: HistoryFilters; message_id?: number }) =>
-    post<Task>('/api/tasks', body),
-  cancelTask: (id: string) => post<OKResponse>(`/api/tasks/${id}/cancel`),
-  retryTask: (id: string) => post<Task>(`/api/tasks/${id}/retry`),
-  resolve: (input: string) => post<ResolvedTarget>('/api/resolve', { input }),
+    post<Task>(withToken('/api/tasks'), body),
+  cancelTask: (id: string) => post<OKResponse>(withToken(`/api/tasks/${id}/cancel`)),
+  retryTask: (id: string) => post<Task>(withToken(`/api/tasks/${id}/retry`)),
+  resolve: (input: string) => post<ResolvedTarget>(withToken('/api/resolve'), { input }),
 
-  setConcurrency: (n: number) => post<DownloadSettings>('/api/download/concurrency', { max_concurrent: n }),
-  pauseMedia: (id: string) => post<OKResponse>(`/api/media/${encodeURIComponent(id)}/pause`),
-  resumeMedia: (id: string) => post<OKResponse>(`/api/media/${encodeURIComponent(id)}/resume`),
-  pauseAll: () => post<OKResponse>('/api/media/pause-all'),
-  resumeAll: () => post<OKResponse>('/api/media/resume-all'),
+  setConcurrency: (n: number) => post<DownloadSettings>(withToken('/api/download/concurrency'), { max_concurrent: n }),
+  pauseMedia: (id: string) => post<OKResponse>(withToken(`/api/media/${encodeURIComponent(id)}/pause`)),
+  resumeMedia: (id: string) => post<OKResponse>(withToken(`/api/media/${encodeURIComponent(id)}/resume`)),
+  pauseAll: () => post<OKResponse>(withToken('/api/media/pause-all')),
+  resumeAll: () => post<OKResponse>(withToken('/api/media/resume-all')),
 
-  history: (params: URLSearchParams) => get<HistoryPage>('/api/history?' + params.toString()),
-  historyStats: (params: URLSearchParams) => get<HistoryStatsResponse>('/api/history/stats?' + params.toString()),
+  history: (params: URLSearchParams) => get<HistoryPage>(withToken('/api/history?' + params.toString())),
+  historyStats: (params: URLSearchParams) => get<HistoryStatsResponse>(withToken('/api/history/stats?' + params.toString())),
 
-  schedules: () => get<Schedule[]>('/api/schedules'),
+  schedules: () => get<Schedule[]>(withToken('/api/schedules')),
   createSchedule: (body: { chat_id: number; chat_title?: string; interval_min: number; filters?: HistoryFilters }) =>
-    post<Schedule>('/api/schedules', body),
-  deleteSchedule: (id: string) => request<OKResponse>(`/api/schedules/${id}`, { method: 'DELETE' }),
+    post<Schedule>(withToken('/api/schedules'), body),
+  deleteSchedule: (id: string) =>
+    request<OKResponse>(withToken(`/api/schedules/${id}`), { method: 'DELETE' }),
   toggleSchedule: (id: string, enabled: boolean) =>
-    post<OKResponse>(`/api/schedules/${id}/toggle`, { enabled }),
+    post<OKResponse>(withToken(`/api/schedules/${id}/toggle`), { enabled }),
 
   exportChat: (chat_id: number, chat_title: string, limit: number) =>
-    post<ExportResult>('/api/export', { chat_id, chat_title, limit }),
+    post<ExportResult>(withToken('/api/export'), { chat_id, chat_title, limit }),
 }
 
 // 媒体 URL：按 history id 寻址，后端据此查库拿路径（见 internal/web/media.go）

@@ -28,6 +28,7 @@ chat:
 
 log:
   level: "info"  # 日志级别: debug, info, warn, error
+  # file: ""      # 非空时日志同时写入该文件（按 10MB 轮转，保留 3 个历史）；桌面客户端默认开启
 
 session:
   dir: "./sessions"  # 会话文件保存目录

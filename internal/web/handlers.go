@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +32,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/auth/abort", s.handleAuthAbort)
 	mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("GET /api/settings", s.handleSettings)
+	mux.HandleFunc("POST /api/settings", s.handleSettingsUpdate)
 	mux.HandleFunc("POST /api/settings/classify", s.handleSettingsClassify)
 	mux.HandleFunc("GET /api/tasks", s.handleTasksList)
 	mux.HandleFunc("POST /api/tasks", s.handleTasksCreate)
@@ -68,37 +67,7 @@ const uiNotBuiltMessage = `<!doctype html><meta charset="utf-8"><title>Tg-Down</
 
 // handleIndex 提供前端：静态资源直接从内嵌的 dist 里取，其余路径回落到 index.html（SPA 路由）。
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if !uiBuilt() {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(uiNotBuiltMessage))
-		return
-	}
-
-	// 带扩展名的路径当作静态资源；命中就直接返回（带上长缓存——Vite 的文件名里有内容哈希）
-	name := strings.TrimPrefix(r.URL.Path, "/")
-	if name != "" && path.Ext(name) != "" {
-		if f, err := uiFS.Open(name); err == nil {
-			_ = f.Close()
-			if strings.HasPrefix(name, "assets/") {
-				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-			}
-			http.FileServerFS(uiFS).ServeHTTP(w, r)
-			return
-		}
-		http.NotFound(w, r)
-		return
-	}
-
-	// 其余一律回 index.html，交给前端路由
-	data, err := fs.ReadFile(uiFS, "index.html")
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "读取前端产物失败")
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(data)
+	handleUI(w, r)
 }
 
 func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
@@ -301,42 +270,6 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	completed = true
 	s.writeOK(w)
-}
-
-func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
-	s.writeJSON(w, s.settingsSnapshot())
-}
-
-func (s *Server) handleSettingsClassify(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		ClassifyByType bool `json:"classify_by_type"`
-	}
-	if !s.decode(w, r, &body) {
-		return
-	}
-	if err := s.client.SetClassifyByType(body.ClassifyByType); err != nil {
-		s.writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	s.logger.Info("按媒体类型分类存储已%s", map[bool]string{true: "开启", false: "关闭"}[body.ClassifyByType])
-	s.writeJSON(w, s.settingsSnapshot())
-}
-
-func (s *Server) settingsSnapshot() settingsDTO {
-	return settingsDTO{
-		DownloadPath:   s.client.DownloadPath(),
-		ClassifyByType: s.client.ClassifyByType(),
-		MediaConcurrency: downloadSettingsDTO{
-			MaxConcurrent: s.client.DownloadConcurrency(),
-			Active:        s.client.ActiveDownloadCount(),
-		},
-	}
-}
-
-type settingsDTO struct {
-	DownloadPath     string              `json:"download_path"`
-	ClassifyByType   bool                `json:"classify_by_type"`
-	MediaConcurrency downloadSettingsDTO `json:"media_concurrency"`
 }
 
 func (s *Server) handleTasksList(w http.ResponseWriter, _ *http.Request) {

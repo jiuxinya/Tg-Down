@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -101,10 +102,11 @@ type Server struct {
 	queue         *queue.Manager
 	logger        *logger.Logger
 	addr          string
-	downloadRoot  string   // 下载根目录：媒体服务端点据此做越界校验
-	token         string   // 访问令牌（TG_DOWN_WEB_TOKEN）；非本地监听时必需
-	allowedHosts  []string // 额外放行的 Host 白名单
-	trustProxy    bool     // 是否信任反向代理提供的 X-Forwarded-Proto
+	cfg           *config.Config // 与引擎共享的配置指针；设置页热更新经它持久化
+	downloadRoot  string         // 下载根目录：媒体服务端点据此做越界校验
+	token         string         // 访问令牌（TG_DOWN_WEB_TOKEN）；非本地监听时必需
+	allowedHosts  []string       // 额外放行的 Host 白名单
+	trustProxy    bool           // 是否信任反向代理提供的 X-Forwarded-Proto
 	hub           *sseHub
 	baseCtx       context.Context // 下载任务的生命周期父上下文（在 Run 中设置）
 	serveHTTP     func(*http.Server) error
@@ -145,6 +147,7 @@ func New(client tgapi.Client, st *store.Store, log *logger.Logger, addr string, 
 		queue:        q,
 		logger:       log,
 		addr:         addr,
+		cfg:          cfg,
 		downloadRoot: cfg.Download.Path,
 		token:        os.Getenv(webTokenEnv),
 		allowedHosts: parseAllowedHosts(os.Getenv(allowedHostsEnv)),
@@ -160,8 +163,8 @@ func New(client tgapi.Client, st *store.Store, log *logger.Logger, addr string, 
 	}
 }
 
-// Run 启动后台 Telegram 连接与 HTTP 服务，阻塞直到 ctx 取消
-func (s *Server) Run(ctx context.Context) error {
+// validateAccess 校验监听地址对应的鉴权要求（非回环或代理场景必须配置令牌）
+func (s *Server) validateAccess() error {
 	tokenRequired := !isLoopbackAddr(s.addr) || len(s.allowedHosts) > 0 || s.trustProxy
 	if tokenRequired && s.token == "" {
 		return fmt.Errorf("监听非本地地址或配置代理 Host 时必须通过环境变量 %s 设置访问令牌，否则拒绝启动", webTokenEnv)
@@ -169,12 +172,29 @@ func (s *Server) Run(ctx context.Context) error {
 	if tokenRequired && utf8.RuneCountInString(strings.TrimSpace(s.token)) < minWebTokenLength {
 		return fmt.Errorf("%s 至少需要 %d 个字符；请使用随机生成的高强度令牌", webTokenEnv, minWebTokenLength)
 	}
+	return nil
+}
 
+// newHTTPServer 构造带路由与安全中间件的 http.Server
+func (s *Server) newHTTPServer() *http.Server {
+	mux := http.NewServeMux()
+	s.routes(mux)
+	return &http.Server{
+		Addr:              s.addr,
+		Handler:           s.withSecurity(mux),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		// 不设置 WriteTimeout：SSE 事件流为长连接，写超时会中断推送。
+	}
+}
+
+// prepare 启动后台组件（Telegram 连接循环、状态快照、任务队列、关闭监视）。
+// 返回派生上下文、资源释放函数与等待全部后台退出的函数；serve 返回后必须先 stop 再 wait，
+// 否则关闭监视 goroutine 会因 runCtx 未取消而永久阻塞。
+func (s *Server) prepare(ctx context.Context, srv *http.Server) (context.Context, func(), func()) {
 	runCtx, stop := context.WithCancel(ctx)
-	defer stop()
 	s.baseCtx = runCtx
 	s.logger.SetHook(s.onLog)
-	defer s.logger.SetHook(nil)
 
 	s.queue.SetOnChange(s.onTaskChange)
 	var background sync.WaitGroup
@@ -189,16 +209,6 @@ func (s *Server) Run(ctx context.Context) error {
 	startBackground(func() { s.snapshotLoop(runCtx) })
 	startBackground(func() { s.queue.Run(runCtx) })
 
-	mux := http.NewServeMux()
-	s.routes(mux)
-	srv := &http.Server{
-		Addr:              s.addr,
-		Handler:           s.withSecurity(mux),
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		// 不设置 WriteTimeout：SSE 事件流为长连接，写超时会中断推送。
-	}
-
 	startBackground(func() { //nolint:gosec // 父 ctx 已取消，关闭需独立超时窗口
 		<-runCtx.Done()
 		// 运行中任务的 ctx 派生自同一个 ctx，取消已沿调用链自动传播，
@@ -207,6 +217,40 @@ func (s *Server) Run(ctx context.Context) error {
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 	})
+	return runCtx, stop, background.Wait
+}
+
+// finish 收尾：释放上下文资源、撤销日志钩子、等待后台退出并归一化错误
+func (s *Server) finish(serveErr error, stop func(), wait func()) error {
+	stop()
+	s.logger.SetHook(nil)
+	wait()
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return fmt.Errorf("HTTP 服务失败: %w", serveErr)
+	}
+	return nil
+}
+
+// Serve 在已绑定的监听器上运行完整服务（含 Telegram 连接），阻塞直到 ctx 取消。
+// 桌面壳入口：先自行 net.Listen("tcp", "127.0.0.1:0")，经 ln.Addr() 拿到实际端口后再传入。
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	if err := s.validateAccess(); err != nil {
+		return err
+	}
+	srv := s.newHTTPServer()
+	_, stop, wait := s.prepare(ctx, srv)
+	s.logger.Info("Web 管理端已启动: http://%s", ln.Addr().String())
+	err := srv.Serve(ln)
+	return s.finish(err, stop, wait)
+}
+
+// Run 启动后台 Telegram 连接与 HTTP 服务，阻塞直到 ctx 取消
+func (s *Server) Run(ctx context.Context) error {
+	if err := s.validateAccess(); err != nil {
+		return err
+	}
+	srv := s.newHTTPServer()
+	_, stop, wait := s.prepare(ctx, srv)
 
 	if !isLoopbackAddr(s.addr) {
 		s.logger.Info("Web 端监听非本地地址 %s，已启用访问令牌鉴权", s.addr)
@@ -215,15 +259,17 @@ func (s *Server) Run(ctx context.Context) error {
 
 	serve := s.serveHTTP
 	if serve == nil {
-		serve = func(server *http.Server) error { return server.ListenAndServe() }
+		serve = func(server *http.Server) error {
+			ln, err := net.Listen("tcp", server.Addr)
+			if err != nil {
+				return err
+			}
+			defer ln.Close() //nolint:errcheck
+			return server.Serve(ln)
+		}
 	}
 	err := serve(srv)
-	stop()
-	background.Wait()
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("HTTP 服务失败: %w", err)
-	}
-	return nil
+	return s.finish(err, stop, wait)
 }
 
 // runTelegram 连接并认证 Telegram；TDLib 在授权后自行维持/重连，
