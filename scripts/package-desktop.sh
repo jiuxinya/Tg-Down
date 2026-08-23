@@ -56,8 +56,27 @@ case "$OS" in
 </dict></plist>
 PLIST
 
-    # dmg：未签名版本；用户首次打开需右键 → 打开（Gatekeeper）
-    hdiutil create -volname "Tg-Down" -srcfolder "$DIST/$APP" -ov -format udzo "$DIST/$NAME.dmg" >/dev/null
+    # dmg：未签名版本；用户首次打开需右键 → 打开（Gatekeeper）。
+    # 注意：macOS 26 起 hdiutil create 的 UDZO(zlib) 格式报 Function not implemented，
+    # 改用全系统可用的 UDBZ；CI 虚拟机 runner 上 hdiutil 本身偶发失败
+    # （actions/runner-images#12323、electron-builder#9155），保留重试兜底，
+    # 每次重试前清理可能残留的挂载点，避免 resource busy。
+    dmg_retry() {
+      local log="$DIST/hdiutil-retry.log"
+      : >"$log"
+      local attempt
+      for attempt in 1 2 3 4 5; do
+        hdiutil detach "/Volumes/Tg-Down" -force >/dev/null 2>&1 || true
+        if hdiutil create -volname "Tg-Down" -srcfolder "$DIST/$APP" -ov -format UDBZ "$DIST/$NAME.dmg" >>"$log" 2>&1; then
+          return 0
+        fi
+        sleep "$attempt"
+      done
+      cat "$log" >&2
+      echo "hdiutil create 重试 5 次仍失败" >&2
+      return 1
+    }
+    dmg_retry
     echo ">>> $DIST/$NAME.dmg"
     ;;
 
