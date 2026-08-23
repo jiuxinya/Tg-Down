@@ -244,7 +244,7 @@ jobs:
 
       - name: Build desktop package
         run: |
-          export CGO_LDFLAGS="-L$HOME/.tdlib/lib $(bash scripts/tdlib-libs.sh --print)"
+          # CGO_CFLAGS/CGO_LDFLAGS 由 setup-tdlib 统一导出（含 TDLib 与 OpenSSL 路径），勿覆盖
           go build -tags "desktop,production,webkit2_41" -buildvcs=false \
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o dist/desktop/tg-down-desktop ./cmd/desktop
@@ -283,7 +283,8 @@ jobs:
 
       - name: Build desktop package
         run: |
-          export CGO_LDFLAGS="-L$HOME/.tdlib/lib $(bash scripts/tdlib-libs.sh --print) -framework UniformTypeIdentifiers"
+          # 在 setup-tdlib 导出的 CGO_LDFLAGS（含 Homebrew OpenSSL 路径）上追加框架，勿整体覆盖
+          export CGO_LDFLAGS="$CGO_LDFLAGS -framework UniformTypeIdentifiers"
           go build -tags "desktop,production" -buildvcs=false \
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
             -o dist/desktop/tg-down-desktop ./cmd/desktop

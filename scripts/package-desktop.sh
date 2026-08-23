@@ -99,6 +99,16 @@ NSI
     echo ">>> $DIST/$NAME.tar.gz"
 
     if command -v nfpm >/dev/null 2>&1; then
+      # .desktop 先落盘再经 src/dst 打包：nfpm 的 files 段不支持 content 内联字段
+      mkdir -p "$DIST/pkg/usr/share/applications"
+      cat > "$DIST/pkg/usr/share/applications/tg-down-desktop.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Tg-Down
+Exec=tg-down-desktop
+Terminal=false
+Categories=Network;
+DESKTOP
       cat > "$DIST/nfpm.yaml" <<YAML
 name: tg-down-desktop
 arch: $ARCH
@@ -115,13 +125,7 @@ contents:
     dst: /usr/local/bin/tg-down-desktop
   - src: $ROOT/internal/desktop/assets/tray.png
     dst: /opt/tg-down/appicon.png
-  - content: |
-      [Desktop Entry]
-      Type=Application
-      Name=Tg-Down
-      Exec=tg-down-desktop
-      Terminal=false
-      Categories=Network;
+  - src: $DIST/pkg/usr/share/applications/tg-down-desktop.desktop
     dst: /usr/share/applications/tg-down-desktop.desktop
 depends:
   - libgtk-3-0

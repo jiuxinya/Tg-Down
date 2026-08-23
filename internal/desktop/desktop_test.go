@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -86,8 +87,11 @@ func TestRegistryCRUDAndPersistence(t *testing.T) {
 	if reg2.Selected() != LocalInstanceID {
 		t.Fatalf("删除选中项后应回落 local，got %q", reg2.Selected())
 	}
-	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Fatalf("注册表文件权限 = %v, want 0600", fi.Mode().Perm())
+	// POSIX 权限断言在 Windows 上无意义（NTFS 经 Go 呈现为 0666）
+	if runtime.GOOS != "windows" {
+		if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Fatalf("注册表文件权限 = %v, want 0600", fi.Mode().Perm())
+		}
 	}
 }
 
