@@ -32,7 +32,8 @@ const (
 	// currentSchemaVersion 是本版本期望的 schema 版本；低于它的库在 Open 时跑一次迁移并打上标记。
 	// v2：history 增加 thumb_path / minithumb（画廊缩略图）。
 	// v3：tasks 增加定时任务恢复与仅补失败文件所需的运行态字段。
-	currentSchemaVersion = 3
+	// v4：schema_version 改为恒定单行；清理过时索引纳入版本闸门。
+	currentSchemaVersion = 4
 )
 
 // schemaTables 定义全部建表语句。
@@ -101,7 +102,11 @@ CREATE TABLE IF NOT EXISTS schedules (
   last_max_id  INTEGER NOT NULL DEFAULT 0
 );
 
+-- schema_version 恒定单行：id 固定为 1，由 setSchemaVersion 以 upsert 维护。
+-- 早期版本这里是一张无约束的追加表，靠 MAX(version) 读取，行数随升级次数增长，
+-- 也让"当前版本"这一语义在表结构上无从体现。
 CREATE TABLE IF NOT EXISTS schema_version (
+  id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
 `
@@ -188,10 +193,6 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("创建索引失败: %w", err)
 	}
-	if err := dropObsoleteIndexes(ctx, db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	if err := hardenDatabaseFiles(path); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -237,14 +238,70 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		return nil
 	}
 
+	// migrateSchemaVersionTable 必须最先跑：它把版本表改成恒定单行，
+	// 之后的 setSchemaVersion 才能按 upsert 写入。
 	for _, step := range []func(context.Context, *sql.DB) error{
-		migrateTasksTable, migrateHistoryTable, migrateSchedulesTable,
+		migrateSchemaVersionTable, migrateTasksTable, migrateHistoryTable, migrateSchedulesTable,
+		dropObsoleteIndexes,
 	} {
 		if err := step(ctx, db); err != nil {
 			return err
 		}
 	}
 	return setSchemaVersion(ctx, db, currentSchemaVersion)
+}
+
+// migrateSchemaVersionTable 把早期的追加式版本表改造成恒定单行。
+//
+// 早期形态是无约束的 (version INTEGER NOT NULL)，setSchemaVersion 每次升级 INSERT 一行、
+// 读取靠 MAX(version)，行数随升级次数增长。CREATE TABLE IF NOT EXISTS 对已存在的表是空操作，
+// 因而老库不会自动获得新结构，只能在此显式重建。
+func migrateSchemaVersionTable(ctx context.Context, db *sql.DB) error {
+	hasID, err := columnExists(ctx, db, "schema_version", "id")
+	if err != nil {
+		return err
+	}
+	if hasID {
+		return nil
+	}
+	// 保留已记录的最高版本，避免重建后被当成全新库再跑一遍迁移
+	v, err := schemaVersion(ctx, db)
+	if err != nil {
+		return err
+	}
+	stmts := []string{
+		`DROP TABLE schema_version`,
+		`CREATE TABLE schema_version (
+  id      INTEGER PRIMARY KEY CHECK (id = 1),
+  version INTEGER NOT NULL
+)`,
+	}
+	for _, q := range stmts {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("重建 schema_version 表失败: %w", err)
+		}
+	}
+	if v > 0 {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO schema_version (id, version) VALUES (1, ?)`, v); err != nil {
+			return fmt.Errorf("回填 schema 版本失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// columnExists 报告表中是否存在指定列
+func columnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT 1 FROM pragma_table_info(?) WHERE name = ?`, table, column)
+	if err != nil {
+		return false, fmt.Errorf("检查 %s.%s 是否存在失败: %w", table, column, err)
+	}
+	defer func() { _ = rows.Close() }()
+	exists := rows.Next()
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("检查 %s.%s 是否存在失败: %w", table, column, err)
+	}
+	return exists, nil
 }
 
 // sqliteDSN 使用 URL 结构化编码数据库路径，避免路径中的 ?/#/% 被 SQLite 当成 URI 参数。
@@ -286,9 +343,11 @@ func schemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 	return int(v.Int64), nil
 }
 
-// setSchemaVersion 记录已应用的 schema 版本
+// setSchemaVersion 记录已应用的 schema 版本（恒定单行，重复调用覆盖而非追加）
 func setSchemaVersion(ctx context.Context, db *sql.DB, v int) error {
-	if _, err := db.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (?)`, v); err != nil {
+	const q = `INSERT INTO schema_version (id, version) VALUES (1, ?)
+ON CONFLICT(id) DO UPDATE SET version = excluded.version`
+	if _, err := db.ExecContext(ctx, q, v); err != nil {
 		return fmt.Errorf("记录 schema 版本失败: %w", err)
 	}
 	return nil

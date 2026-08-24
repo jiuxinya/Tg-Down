@@ -330,6 +330,8 @@ function TaskCard({ task: t }: { task: Task }) {
             {s.failed > 0 && <span style="color:var(--err)">失败 {s.failed}</span>}
             <span>共 {total || '?'}</span>
             <span class="grow" />
+            {t.speed_bps ? <span>{fmtSpeed(t.speed_bps)}</span> : null}
+            {t.eta_seconds ? <span>剩余 {fmtDuration(t.eta_seconds)}</span> : null}
             <span>{fmtSize(s.downloaded_size)}</span>
           </div>
         </>

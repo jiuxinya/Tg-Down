@@ -37,18 +37,25 @@ func TestIsValid(t *testing.T) {
 	}
 }
 
-// TestDefaultTypes 锁定"下载全部"的语义：默认集必须和全部可下载类型完全一致，包含贴纸。
+// TestDefaultTypes 锁定默认类型集的两条性质：不含贴纸，且其余类型全部可服务端枚举。
+//
+// 后者是本组断言的要害：只要默认集里混进一个无服务端过滤器的类型，未指定类型的任务
+// 就会整体退回全量翻页并丢失进度分母。用 HasServerFilter 逐项校验而非硬编码类型名单，
+// 将来新增不可枚举的类型时这条会直接失败，而不是等到线上发现扫描变慢。
 func TestDefaultTypes(t *testing.T) {
-	if len(DefaultTypes) != len(AllTypes) {
-		t.Fatalf("DefaultTypes = %v, want %v", DefaultTypes, AllTypes)
+	if contains(DefaultTypes, Sticker) {
+		t.Error("默认下载类型不应包含贴纸：它会使整个任务退化为全量翻页且总数未知")
 	}
-	for i := range AllTypes {
-		if DefaultTypes[i] != AllTypes[i] {
-			t.Errorf("DefaultTypes[%d] = %q, want %q", i, DefaultTypes[i], AllTypes[i])
+	if len(DefaultTypes) != len(AllTypes)-1 {
+		t.Errorf("DefaultTypes 应为 AllTypes 去掉贴纸，得到 %v", DefaultTypes)
+	}
+	for _, mt := range DefaultTypes {
+		if !IsValid(mt) {
+			t.Errorf("DefaultTypes 含非法类型 %q", mt)
 		}
-	}
-	if !contains(DefaultTypes, Sticker) {
-		t.Error("默认下载类型必须包含贴纸")
+		if !HasServerFilter(mt) {
+			t.Errorf("默认类型 %q 不可服务端枚举，会拖垮未指定类型的任务", mt)
+		}
 	}
 	if HasServerFilter(Sticker) {
 		t.Error("贴纸不应声明为可服务端枚举：TDLib 没有专用搜索过滤器")

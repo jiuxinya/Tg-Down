@@ -272,3 +272,94 @@ INSERT INTO schema_version(version) VALUES (2);`
 		t.Fatalf("v3 task fields after v2 upgrade: row=%+v err=%v", got, err)
 	}
 }
+
+// legacyAppendOnlyVersionTable 是 v3.x 及更早的版本表形态：无主键、无唯一约束，
+// setSchemaVersion 每次升级追加一行，读取靠 MAX(version)。
+const legacyAppendOnlyVersionTable = `
+CREATE TABLE schema_version (
+  version INTEGER NOT NULL
+);
+`
+
+// TestOpen_RebuildsAppendOnlySchemaVersionTable 校验追加式版本表被重建为恒定单行，
+// 且已记录的版本不丢——丢了会让老库被当成全新库，把全部迁移步骤（含两条全表 UPDATE）
+// 再跑一遍。
+func TestOpen_RebuildsAppendOnlySchemaVersionTable(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open(driverName, sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatalf("打开原始库失败: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := raw.ExecContext(ctx, schemaTables); err != nil {
+		t.Fatalf("建表失败: %v", err)
+	}
+	// 换成旧形态并模拟多次升级留下的多行
+	if _, err := raw.ExecContext(ctx, `DROP TABLE schema_version`); err != nil {
+		t.Fatalf("删除版本表失败: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, legacyAppendOnlyVersionTable); err != nil {
+		t.Fatalf("建旧版本表失败: %v", err)
+	}
+	for _, v := range []int{2, 3} {
+		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (?)`, v); err != nil {
+			t.Fatalf("写入旧版本行失败: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("关闭原始库失败: %v", err)
+	}
+
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() 升级旧版本表失败: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	var rows int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_version`).Scan(&rows); err != nil {
+		t.Fatalf("统计版本行数失败: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("版本表行数 = %d，期望恒为 1", rows)
+	}
+	v, err := schemaVersion(ctx, st.db)
+	if err != nil {
+		t.Fatalf("读取版本失败: %v", err)
+	}
+	if v != currentSchemaVersion {
+		t.Errorf("升级后版本 = %d，期望 %d", v, currentSchemaVersion)
+	}
+	// CHECK (id = 1) 必须生效，否则"恒定单行"只是约定而非约束
+	if _, err := st.db.ExecContext(ctx,
+		`INSERT INTO schema_version (id, version) VALUES (2, 99)`); err == nil {
+		t.Error("版本表允许插入第二行，单行约束未生效")
+	}
+}
+
+// TestOpen_ReopenKeepsSingleVersionRow 校验重复打开不会累积版本行。
+func TestOpen_ReopenKeepsSingleVersionRow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "reopen.db")
+	for i := range 3 {
+		st, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("第 %d 次 Open 失败: %v", i+1, err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("第 %d 次 Close 失败: %v", i+1, err)
+		}
+	}
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open 失败: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var rows int
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM schema_version`).Scan(&rows); err != nil {
+		t.Fatalf("统计版本行数失败: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("反复打开后版本行数 = %d，期望 1", rows)
+	}
+}

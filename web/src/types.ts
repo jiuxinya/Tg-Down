@@ -52,6 +52,8 @@ export interface Task {
   scanned_messages?: number
   found_media?: number
   scan_cursor?: number
+  speed_bps?: number
+  eta_seconds?: number
   attempts?: number
   filters?: HistoryFilters | null
   message_id?: number

@@ -1004,6 +1004,9 @@ func (d *Downloader) skipIfComplete(ctx context.Context, media *MediaInfo, fileP
 	}
 	d.logger.Debug("文件已存在，跳过下载: %s", media.FileName)
 	d.recordSkip(ctx, media, filePath, "")
+	// 文件可能来自开关关闭时的旧运行或外部工具，此时并无 sidecar；补一份使
+	// "开关开启后每个受管文件都有元数据"成立。
+	d.ensureMetadataSidecar(media, filePath)
 	return true
 }
 
@@ -1040,6 +1043,9 @@ func (d *Downloader) copyFromDuplicate(ctx context.Context, media *MediaInfo, fi
 	}
 	d.logger.Info("内容重复，已从既有文件复制: %s <- %s", media.FileName, src)
 	d.recordSkip(ctx, media, filePath, "duplicate of "+src)
+	// 去重复制出的文件同样要有 sidecar：linkOrCopy 优先硬链接，但 .json 是按目标
+	// 路径独立的文件，不会随硬链接一起出现。
+	d.ensureMetadataSidecar(media, filePath)
 	return true
 }
 
@@ -1141,6 +1147,22 @@ type mediaSidecar struct {
 	FileName  string `json:"file_name"`
 	FileSize  int64  `json:"file_size"`
 	MimeType  string `json:"mime_type"`
+}
+
+// ensureMetadataSidecar 在 sidecar 尚不存在时补写一份。
+//
+// 用于文件并非由本次下载产生、但确实在此路径落了盘的两条路径：内容去重复制，
+// 以及目标文件已存在而跳过。它们此前都在 writeMetadataSidecar 的调用点之前返回，
+// 于是同一份内容先在哪个聊天下载，决定了另一处有没有 sidecar。
+// 已存在则不覆盖：那份是当初下载时按其自身消息写的，比这次的更贴切。
+func (d *Downloader) ensureMetadataSidecar(media *MediaInfo, filePath string) {
+	if !d.saveMetadata.Load() {
+		return
+	}
+	if _, err := os.Stat(filePath + ".json"); err == nil {
+		return
+	}
+	d.writeMetadataSidecar(media, filePath)
 }
 
 // writeMetadataSidecar 在开关开启时写 <文件>.json 元数据（best-effort，失败仅告警）

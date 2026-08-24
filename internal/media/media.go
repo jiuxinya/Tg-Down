@@ -29,9 +29,23 @@ const (
 // 新增类型时只需在此登记并补齐下方的规则表。
 var AllTypes = []string{Photo, Video, Document, Animation, Audio, Voice, Sticker, VideoNote}
 
-// DefaultTypes 是未指定媒体类型时实际下载的类型集。空过滤器语义必须是真正的
-// “全部类型”，因此这里包含贴纸；调用方若只想下载子集，必须显式传入该子集。
-var DefaultTypes = append([]string(nil), AllTypes...)
+// DefaultTypes 是未指定媒体类型时实际下载的类型集：AllTypes 去掉贴纸。
+//
+// 之所以不等于 AllTypes：贴纸没有 SearchMessagesFilter（见下方 serverFilterable），
+// 只要它出现在类型集里，整个任务就会退化——扫描从"每类型一条服务端枚举管线"退回
+// 单条 SearchMessagesFilterEmpty 全量翻页，计数直接返回未知使进度条失去分母。
+// 而"不指定类型"是最常见的建任务方式，让它带上贴纸等于让服务端枚举对多数任务失效。
+// 需要贴纸的调用方显式把 Sticker 放进类型集，并接受该任务的全量遍历代价。
+var DefaultTypes = func() []string {
+	types := make([]string, 0, len(AllTypes))
+	for _, t := range AllTypes {
+		if t == Sticker {
+			continue
+		}
+		types = append(types, t)
+	}
+	return types
+}()
 
 // validTypes 是 AllTypes 的集合形式，供 IsValid 做 O(1) 判定。
 var validTypes = func() map[string]bool {

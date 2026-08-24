@@ -85,8 +85,14 @@ type TaskDTO struct {
 	// ScannedMessages/FoundMedia 是 history 任务扫描历史的实时进度（仅运行中有值，不落库）
 	ScannedMessages int64 `json:"scanned_messages,omitempty"`
 	FoundMedia      int64 `json:"found_media,omitempty"`
-	// ScanCursor 是持久化的历史扫描游标（最后已扫描页的最旧 message_id），重启恢复时续扫起点
+	// ScanCursor 是持久化的历史扫描游标（最后已扫描页的最旧 message_id），重启恢复时续扫起点。
+	// 多类型任务按类型拆成多条扫描管线，单个整数表达不了 N 条管线的位置，因此不追踪游标，此处恒为 0。
 	ScanCursor int64 `json:"scan_cursor,omitempty"`
+	// SpeedBps 是该任务的下载速度（字节/秒），按窗口内完成文件的累计字节推算；仅运行中有值。
+	// 与 /api/state 里的全局 speed_bps 不同：那是所有任务共用的分子。
+	SpeedBps int64 `json:"speed_bps,omitempty"`
+	// ETASeconds 是预计剩余秒数；总数未知（如带过滤器或含贴纸）时为 0，表示不可估算
+	ETASeconds int64 `json:"eta_seconds,omitempty"`
 	// Attempts 是自动重试已消耗的次数
 	Attempts int `json:"attempts,omitempty"`
 	// Filters 是任务级过滤条件（nil = 不过滤）

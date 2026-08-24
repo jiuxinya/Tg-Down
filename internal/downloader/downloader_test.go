@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -726,6 +727,110 @@ func TestDownloadMedia_RejectsSymlinksInTargetPath(t *testing.T) {
 				t.Fatalf("外部文件被修改: %q, %v", got, err)
 			}
 		})
+	}
+}
+
+// TestMetadataSidecar_CoversDedupAndSkipPaths 锁定 sidecar 的覆盖面：只要开关开启，
+// 文件是怎么落到目标路径的都不影响它有元数据。
+//
+// 回归的是这样一个缺陷：writeMetadataSidecar 只挂在下载完成路径上，而内容去重复制与
+// 目标文件已存在这两条路径都在其之前返回，于是同一份内容先在哪个聊天下载，
+// 决定了另一处有没有 .json。
+func TestMetadataSidecar_CoversDedupAndSkipPaths(t *testing.T) {
+	dir := t.TempDir()
+	d := New(dir, 1, logger.New(logger.LevelError))
+	d.SetSaveMetadata(true)
+	d.SetDownloadFunc(func(_ context.Context, _ *MediaInfo, path string) error {
+		return os.WriteFile(path, []byte("payload"), 0o600)
+	})
+
+	// 先正常下载一份，作为去重源
+	origin := &MediaInfo{
+		MessageID: 1, TDFileID: 1, UniqueID: "u-1", MediaType: "document",
+		FileName: "origin.bin", FileSize: 7, ChatID: 100,
+	}
+	if err := d.DownloadMedia(context.Background(), origin); err != nil {
+		t.Fatalf("下载去重源失败: %v", err)
+	}
+	originPath := filepath.Join(dir, "chat_100", "origin.bin")
+
+	// 去重路径：另一个聊天里的同一份内容
+	d.SetDuplicateLookupFunc(func(_ context.Context, uniqueID string) (string, bool) {
+		if uniqueID == "u-1" {
+			return originPath, true
+		}
+		return "", false
+	})
+	dup := &MediaInfo{
+		MessageID: 2, TDFileID: 2, UniqueID: "u-1", MediaType: "document",
+		FileName: "dup.bin", FileSize: 7, ChatID: 200, Caption: "转发副本",
+	}
+	if err := d.DownloadMedia(context.Background(), dup); err != nil {
+		t.Fatalf("去重复制失败: %v", err)
+	}
+	dupSidecar := filepath.Join(dir, "chat_200", "dup.bin.json")
+	raw, err := os.ReadFile(dupSidecar)
+	if err != nil {
+		t.Fatalf("去重复制的文件没有 sidecar: %v", err)
+	}
+	var payload mediaSidecar
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("sidecar 不是合法 JSON: %v", err)
+	}
+	// 写的必须是本条消息自己的元数据，而不是去重源的
+	if payload.MessageID != 2 || payload.ChatID != 200 || payload.Caption != "转发副本" {
+		t.Errorf("sidecar 内容 = %+v，期望本条消息（msg 2 / chat 200）的元数据", payload)
+	}
+
+	// 跳过路径：文件已在目标位置且大小相符，但没有 sidecar（模拟开关此前关闭）
+	skipDir := filepath.Join(dir, "chat_300")
+	if err := os.MkdirAll(skipDir, DirectoryPermission); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skipDir, "old.bin"), []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := &MediaInfo{
+		MessageID: 3, TDFileID: 3, MediaType: "document",
+		FileName: "old.bin", FileSize: 7, ChatID: 300,
+	}
+	if err := d.DownloadMedia(context.Background(), old); err != nil {
+		t.Fatalf("跳过路径出错: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(skipDir, "old.bin.json")); err != nil {
+		t.Errorf("已存在文件被跳过后未补 sidecar: %v", err)
+	}
+}
+
+// TestMetadataSidecar_SkipDoesNotOverwriteExisting 断言补写不覆盖既有 sidecar：
+// 已有那份是当初下载时按其自身消息写的，比后来跳过时的更贴切。
+func TestMetadataSidecar_SkipDoesNotOverwriteExisting(t *testing.T) {
+	dir := t.TempDir()
+	d := New(dir, 1, logger.New(logger.LevelError))
+	d.SetSaveMetadata(true)
+
+	fileDir := filepath.Join(dir, "chat_100")
+	if err := os.MkdirAll(fileDir, DirectoryPermission); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fileDir, "a.bin"), []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := filepath.Join(fileDir, "a.bin.json")
+	if err := os.WriteFile(sidecar, []byte(`{"message_id":42}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	media := &MediaInfo{
+		MessageID: 7, TDFileID: 7, MediaType: "document",
+		FileName: "a.bin", FileSize: 7, ChatID: 100,
+	}
+	if err := d.DownloadMedia(context.Background(), media); err != nil {
+		t.Fatalf("跳过路径出错: %v", err)
+	}
+	got, err := os.ReadFile(sidecar)
+	if err != nil || string(got) != `{"message_id":42}` {
+		t.Errorf("既有 sidecar 被覆盖: %q, %v", got, err)
 	}
 }
 
