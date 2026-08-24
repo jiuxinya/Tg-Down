@@ -31,10 +31,13 @@ Linux 依赖安装：
 
 ```bash
 # Debian/Ubuntu
-sudo apt install libgtk-3-0 libwebkit2gtk-4.1-0
+sudo apt install libgtk-3-0 libwebkit2gtk-4.1-0 libayatana-appindicator3-1
 # Fedora
-sudo dnf install gtk3 webkit2gtk4.1
+sudo dnf install gtk3 webkit2gtk4.1 libayatana-appindicator-gtk3
 ```
+
+deb / rpm 已声明上述依赖，由包管理器自动装；tar.gz 便携包需手动安装。
+`libayatana-appindicator` 缺失时程序仍可运行，但托盘图标不显示。
 
 ## 从源码构建
 
@@ -80,6 +83,6 @@ Shell 壳服务（internal/desktop）
 | 问题 | 处理 |
 |------|------|
 | 启动即退出，提示 build tags | 必须用 `-tags "desktop,production"` 构建，见上文 |
-| 托盘图标缺失（部分 Wayland） | 设 `TG_DOWN_DESKTOP_NO_TRAY=1` 后运行，或 `--no-tray` 参数 |
+| 托盘图标缺失（Linux） | 多数情况是缺 `libayatana-appindicator`（托盘经 DBus StatusNotifierItem 实现）；deb/rpm 已声明该依赖，tar.gz 需自行安装。仍不显示时设 `TG_DOWN_DESKTOP_NO_TRAY=1` 或加 `--no-tray` 参数 |
 | 远程实例一直转圈 | 「实例… → 测试」看具体错误；确认地址可达且令牌 ≥16 字符 |
 | 日志在哪 | 应用数据目录 `logs/tg-down.log`；设置页可调级别 |

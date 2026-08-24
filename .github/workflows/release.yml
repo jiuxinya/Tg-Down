@@ -83,9 +83,10 @@ jobs:
       - name: Assemble package
         run: |
           install -m 600 config.yaml.example dist/pkg/config.yaml
-          cp .env.example dist/pkg/.env.example || true
-          cp LICENSE dist/pkg/ || true
-          cp README.md dist/pkg/ || true
+          # 无 "|| true"：随包分发的配置样例/许可证/说明缺失属于打包错误，必须当场暴露
+          cp .env.example dist/pkg/.env.example
+          cp LICENSE dist/pkg/
+          cp README.md dist/pkg/
           cat > dist/pkg/start.sh <<'EOF'
           #!/bin/bash
           cd "$(dirname "$0")"
@@ -102,6 +103,7 @@ jobs:
         with:
           name: tg-down-${{ matrix.name }}
           path: tg-down-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
 
   # Windows 单列一个作业：它整条链路都在 MSYS2 shell 里，塞进上面的 matrix 会把
   # 容器/apt 那几步的 shell 语义搅乱。产物是 .zip + .bat（tar.gz + start.sh 在 Windows 上没意义）。
@@ -191,9 +193,10 @@ jobs:
       - name: Assemble package
         run: |
           cp config.yaml.example dist/pkg/config.yaml
-          cp .env.example dist/pkg/.env.example || true
-          cp LICENSE dist/pkg/ || true
-          cp README.md dist/pkg/ || true
+          # 无 "|| true"：随包分发的配置样例/许可证/说明缺失属于打包错误，必须当场暴露
+          cp .env.example dist/pkg/.env.example
+          cp LICENSE dist/pkg/
+          cp README.md dist/pkg/
           # cmd.exe 要 CRLF，printf 显式写死，别指望 heredoc 的行尾
           printf '@echo off\r\ncd /d "%%~dp0"\r\nif not exist downloads mkdir downloads\r\nif not exist sessions mkdir sessions\r\ntg-down.exe %%*\r\n' > dist/pkg/start.bat
 
@@ -206,6 +209,7 @@ jobs:
         with:
           name: tg-down-windows-amd64
           path: tg-down-windows-amd64.zip
+          if-no-files-found: error
 
   # 桌面客户端（Wails 壳，内嵌引擎）。与服务器版同源构建，但产物为安装包/便携包。
   # Linux 桌面用 ubuntu-24.04 + webkit2gtk-4.1（wails 的 webkit2_41 标签），
@@ -239,6 +243,9 @@ jobs:
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
+      - name: Build web UI
+        run: cd web && npm ci --no-audit --no-fund && npm run build
+
       - name: Setup TDLib
         uses: ./.github/actions/setup-tdlib
 
@@ -258,6 +265,7 @@ jobs:
             dist/desktop/tg-down-desktop-linux-amd64.deb
             dist/desktop/tg-down-desktop-linux-amd64.rpm
             dist/desktop/tg-down-desktop-linux-amd64.tar.gz
+          if-no-files-found: error
 
   build-desktop-macos:
     name: Desktop darwin-arm64
@@ -278,6 +286,9 @@ jobs:
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
+      - name: Build web UI
+        run: cd web && npm ci --no-audit --no-fund && npm run build
+
       - name: Setup TDLib
         uses: ./.github/actions/setup-tdlib
 
@@ -295,6 +306,7 @@ jobs:
         with:
           name: tg-down-desktop-darwin-arm64
           path: dist/desktop/tg-down-desktop-darwin-arm64.dmg
+          if-no-files-found: error
 
   build-desktop-windows:
     name: Desktop windows-amd64
@@ -334,6 +346,19 @@ jobs:
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
+      - name: Build web UI
+        shell: pwsh
+        run: cd web; npm ci --no-audit --no-fund; npm run build
+
+      # NSIS 安装包所需；makensis 缺失时 package-desktop.sh 会跳过生成 setup.exe，
+      # 而上传清单与发布说明都列着它，缺件不会自然暴露，故在此显式安装。
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          # choco 只改注册表里的机器 PATH，当前作业的后续 shell 不会自动继承，需显式追加
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Cache TDLib
         id: tdlib-cache
         uses: actions/cache@v4
@@ -368,6 +393,7 @@ jobs:
           path: |
             dist/desktop/tg-down-desktop-windows-amd64.zip
             dist/desktop/tg-down-desktop-windows-amd64-setup.exe
+          if-no-files-found: error
 
   release:
     name: Create Release
