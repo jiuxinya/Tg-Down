@@ -426,6 +426,9 @@ jobs:
             artifacts/tg-down-desktop-*.dmg
             artifacts/tg-down-desktop-*-setup.exe
             artifacts/checksums.txt
+          # 通配符匹配不到文件时失败，而不是静默少发一个产物。
+          # v3.1 的 setup.exe 就是这样缺席的：上传步骤没报错，发布页也照样建出来。
+          fail_on_unmatched_files: true
           generate_release_notes: true
           draft: false
           # 含 '-' 的 tag（如 v2.0.0-rc1）自动标记为预发布
