@@ -60,7 +60,7 @@ jobs:
         uses: ./.github/actions/setup-tdlib
 
       - name: Test
-        run: go test ./...
+        run: go test -race -cover ./...
 
       - name: Build (linux, self-contained rpath)
         if: matrix.name == 'linux-amd64'
@@ -171,7 +171,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Test
-        run: go test ./...
+        run: go test -race -cover ./...
 
       - name: Build
         run: |
