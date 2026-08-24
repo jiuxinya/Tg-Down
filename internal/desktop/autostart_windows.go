@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"fmt"
+	"strings"
 
 	"golang.org/x/sys/windows/registry"
 )

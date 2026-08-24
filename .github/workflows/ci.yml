@@ -82,6 +82,18 @@ jobs:
       - name: Run web tests
         run: cd web && npm test
 
+      # 平台专属文件（autostart_windows.go 等）在本机与 Linux 上根本不参与编译，
+      # 光靠本地构建发现不了缺 import 这类问题——v3.2.0 首次打 tag 就是这样失败的。
+      # 免 CGo 的交叉 vet 很快，放在最前面当护栏。
+      - name: Cross-platform vet (no CGo)
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          for os in windows darwin linux; do
+            echo "--- GOOS=$os ---"
+            GOOS=$os go vet ./internal/desktop/ ./internal/store/ ./internal/logger/
+          done
+
       - name: Run tests
         run: go test -race -cover -tags "desktop,production,webkit2_41" ./...
 
