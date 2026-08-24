@@ -79,7 +79,7 @@ func (f *fakeClient) callCount(id string) int {
 	return f.calls[id]
 }
 
-func (f *fakeClient) monitor() (string, int64) {
+func (f *fakeClient) monitor() (taskID string, chatID int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.monitorTaskID, f.monitorChatID
@@ -205,10 +205,10 @@ func newTestStore(t *testing.T) *store.Store {
 }
 
 // newTestManager 创建已启动 Run(ctx) 的 Manager
-func newTestManager(t *testing.T, maxConcurrent int) (*Manager, *fakeClient) {
+func newTestManager(t *testing.T) (*Manager, *fakeClient) {
 	t.Helper()
 	fc := newFakeClient()
-	m := NewManager(fc, newTestStore(t), logger.New(logger.LevelError), maxConcurrent, 0)
+	m := NewManager(fc, newTestStore(t), logger.New(logger.LevelError), 1, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -302,7 +302,7 @@ func TestRunHistoryTask_CountsBeforeDownload(t *testing.T) {
 
 // TestRunHistoryTask_CountFailureFallsBack 验证计数失败仅回退为未知总数，任务照常执行
 func TestRunHistoryTask_CountFailureFallsBack(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 	fc.setCountErr(1, errors.New("count boom"))
 
 	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
@@ -319,7 +319,7 @@ func TestRunHistoryTask_CountFailureFallsBack(t *testing.T) {
 
 // TestCancel_QueuedTask 验证取消排队中的任务不会触发其实际执行
 func TestCancel_QueuedTask(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	dto1, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
@@ -353,7 +353,7 @@ func TestCancel_QueuedTask(t *testing.T) {
 // StatusQueued 分支），且该任务后续被 worker 从 historyCh 取出触发 runHistoryTask 的早退路径时，
 // 对同一 done 的第二次 markDone 不会 panic（doneClosed 保证幂等）
 func TestCancel_QueuedTask_DoneClosedOnce(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	dto1, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
@@ -393,7 +393,7 @@ func TestCancel_QueuedTask_DoneClosedOnce(t *testing.T) {
 }
 
 func TestWaitForQueuedCancelIncludesFinalNotification(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 	first, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "first")
 	if err != nil {
 		t.Fatal(err)
@@ -460,7 +460,7 @@ func TestWaitForQueuedCancelIncludesFinalNotification(t *testing.T) {
 
 // TestCancel_RunningTask 验证取消运行中的任务会取消其 ctx 并最终落定为 canceled
 func TestCancel_RunningTask(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
@@ -476,7 +476,7 @@ func TestCancel_RunningTask(t *testing.T) {
 }
 
 func TestWaitBlocksUntilCanceledTaskCleanupCompletes(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
 		t.Fatal(err)
@@ -511,7 +511,7 @@ func TestWaitBlocksUntilCanceledTaskCleanupCompletes(t *testing.T) {
 }
 
 func TestWaitHonorsContextAndRejectsUnknownTask(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
 		t.Fatal(err)
@@ -534,7 +534,7 @@ func TestWaitHonorsContextAndRejectsUnknownTask(t *testing.T) {
 
 // TestRetry_FailedTask 验证重试失败任务会以新 ID 重新入队并真正再次执行
 func TestRetry_FailedTask(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
@@ -581,7 +581,7 @@ func TestRetry_FailedTask(t *testing.T) {
 
 // TestMaxConcurrentTasks_Serializes 验证 maxConcurrentTasks=1 时两个 history 任务严格串行执行
 func TestMaxConcurrentTasks_Serializes(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	dto1, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
@@ -610,7 +610,7 @@ func TestMaxConcurrentTasks_Serializes(t *testing.T) {
 // monitor 任务必须独立于 history worker 池运行，即使 maxConcurrentTasks=1 且唯一的 worker
 // 正被一个长期阻塞的 history 任务占用，Enqueue(KindMonitor, ...) 也不能被卡住。
 func TestMonitor_DoesNotBlockHistoryQueue(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	dto1, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
@@ -659,7 +659,7 @@ func TestMonitor_DoesNotBlockHistoryQueue(t *testing.T) {
 
 // TestMonitor_SwitchCancelsPrevious 验证切换监控目标会先取消旧的 monitor 任务再启动新的
 func TestMonitor_SwitchCancelsPrevious(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	first, err := m.Enqueue(KindMonitor, &downloader.HistorySpec{ChatID: 111}, "first")
 	if err != nil {
@@ -682,7 +682,7 @@ func TestMonitor_SwitchCancelsPrevious(t *testing.T) {
 // TestEnqueueHistory_DuplicateChatRejected 验证同一 chat_id 已存在排队中/运行中的 history 任务时，
 // 重复 Enqueue 被拒绝，且既不创建新的内存任务也不写入新的 store 行；任务终结后允许重新入队。
 func TestEnqueueHistory_DuplicateChatRejected(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	dto1, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {
@@ -823,7 +823,7 @@ func TestNewManager_ResumesInterruptedTasksFromStore(t *testing.T) {
 // 事件最终仍会到达 store（轮询等待，而非同步断言），且同一媒体项的 Started 先于 Completed 落盘
 // ——若顺序颠倒，该记录会停留在 downloading 而非到达 completed。
 func TestHandleRecordEvent_AsyncPersistPreservesOrder(t *testing.T) {
-	m, fc := newTestManager(t, 1)
+	m, fc := newTestManager(t)
 
 	dto, err := m.Enqueue(KindHistory, &downloader.HistorySpec{ChatID: 1}, "chat-1")
 	if err != nil {

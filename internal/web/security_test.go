@@ -13,7 +13,7 @@ func newTestRequest(auth, queryToken string) *http.Request {
 	if queryToken != "" {
 		target += "?token=" + queryToken
 	}
-	r := httptest.NewRequest(http.MethodGet, target, nil)
+	r := httptest.NewRequest(http.MethodGet, target, http.NoBody)
 	if auth != "" {
 		r.Header.Set("Authorization", auth)
 	}
@@ -82,7 +82,7 @@ func TestHostAllowed_ExtraAllowedHosts(t *testing.T) {
 
 func TestOriginAllowed(t *testing.T) {
 	s := &Server{addr: "127.0.0.1:8080"}
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/tasks", nil)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/tasks", http.NoBody)
 	req.Host = "127.0.0.1:8080"
 	// 同源
 	if !s.originAllowed("http://127.0.0.1:8080", req) {
@@ -110,7 +110,7 @@ func TestOriginAllowed_WildcardBindStillRejectsCrossSite(t *testing.T) {
 		token:        "0123456789abcdef",
 		allowedHosts: []string{"app.example", "other.example"},
 	}
-	req := httptest.NewRequest(http.MethodPost, "http://app.example/api/tasks", nil)
+	req := httptest.NewRequest(http.MethodPost, "http://app.example/api/tasks", http.NoBody)
 	req.Host = "app.example"
 	if !s.originAllowed("http://app.example", req) {
 		t.Fatal("same external host should be allowed")
@@ -162,7 +162,7 @@ func TestWithSecurity_TokenBootstrapAndProtectedAPI(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	assetReq := httptest.NewRequest(http.MethodGet, "http://example.test/assets/app.js", nil)
+	assetReq := httptest.NewRequest(http.MethodGet, "http://example.test/assets/app.js", http.NoBody)
 	assetReq.Host = "example.test"
 	assetRes := httptest.NewRecorder()
 	handler.ServeHTTP(assetRes, assetReq)
@@ -175,7 +175,7 @@ func TestWithSecurity_TokenBootstrapAndProtectedAPI(t *testing.T) {
 	}
 
 	for _, path := range []string{"/api/state", "/api/events", "/api/history/1/file"} {
-		req := httptest.NewRequest(http.MethodGet, "http://example.test"+path, nil)
+		req := httptest.NewRequest(http.MethodGet, "http://example.test"+path, http.NoBody)
 		req.Host = "example.test"
 		res := httptest.NewRecorder()
 		handler.ServeHTTP(res, req)
@@ -188,7 +188,7 @@ func TestWithSecurity_TokenBootstrapAndProtectedAPI(t *testing.T) {
 	}
 
 	bootstrapReq := httptest.NewRequest(
-		http.MethodGet, "http://example.test/?token=s3cret&tab=tasks", nil,
+		http.MethodGet, "http://example.test/?token=s3cret&tab=tasks", http.NoBody,
 	)
 	bootstrapReq.Host = "example.test"
 	bootstrapRes := httptest.NewRecorder()
@@ -211,7 +211,7 @@ func TestWithSecurity_TokenBootstrapAndProtectedAPI(t *testing.T) {
 		t.Error("bootstrap cookie must not contain the raw token")
 	}
 
-	apiReq := httptest.NewRequest(http.MethodGet, "http://example.test/api/state", nil)
+	apiReq := httptest.NewRequest(http.MethodGet, "http://example.test/api/state", http.NoBody)
 	apiReq.Host = "example.test"
 	apiReq.AddCookie(cookie)
 	apiRes := httptest.NewRecorder()
@@ -220,7 +220,7 @@ func TestWithSecurity_TokenBootstrapAndProtectedAPI(t *testing.T) {
 		t.Errorf("cookie-authenticated API status = %d, want 204", apiRes.Code)
 	}
 
-	badBootstrapReq := httptest.NewRequest(http.MethodGet, "http://example.test/?token=wrong", nil)
+	badBootstrapReq := httptest.NewRequest(http.MethodGet, "http://example.test/?token=wrong", http.NoBody)
 	badBootstrapReq.Host = "example.test"
 	badBootstrapRes := httptest.NewRecorder()
 	handler.ServeHTTP(badBootstrapRes, badBootstrapReq)
@@ -238,7 +238,7 @@ func TestWithSecurity_BootstrapCookieIsSecureBehindHTTPSProxy(t *testing.T) {
 	handler := s.withSecurity(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	req := httptest.NewRequest(http.MethodGet, "http://example.test/?token=s3cret", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/?token=s3cret", http.NoBody)
 	req.Host = "example.test"
 	req.Header.Set("X-Forwarded-Proto", "https")
 	res := httptest.NewRecorder()
@@ -254,7 +254,7 @@ func TestWithSecurity_DoesNotTrustForwardedProtoByDefault(t *testing.T) {
 	handler := s.withSecurity(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	req := httptest.NewRequest(http.MethodGet, "http://example.test/?token=s3cret", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/?token=s3cret", http.NoBody)
 	req.Host = "example.test"
 	req.Header.Set("X-Forwarded-Proto", "https")
 	res := httptest.NewRecorder()
@@ -283,7 +283,7 @@ func TestWithSecurity_BootstrapRedirectStaysLocal(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+			req := httptest.NewRequest(http.MethodGet, "http://example.test/", http.NoBody)
 			req.Host = "example.test"
 			req.URL.Path = tt.path
 			req.URL.RawPath = tt.rawPath

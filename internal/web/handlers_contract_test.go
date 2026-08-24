@@ -149,7 +149,7 @@ func TestHistoryAPIContracts(t *testing.T) {
 		ChatID: 1, MessageID: 2, MediaType: "video", FileName: "b.mp4", FilePath: root + "/b.mp4",
 	})
 
-	listReq := httptest.NewRequest(http.MethodGet, "/api/history?type=photo", nil)
+	listReq := httptest.NewRequest(http.MethodGet, "/api/history?type=photo", http.NoBody)
 	listRes := httptest.NewRecorder()
 	s.handleHistoryList(listRes, listReq)
 	var page historyListResponse
@@ -160,7 +160,7 @@ func TestHistoryAPIContracts(t *testing.T) {
 		t.Fatalf("filtered history = %#v, status = %d", page, listRes.Code)
 	}
 
-	legacyReq := httptest.NewRequest(http.MethodGet, "/api/history?media_type=video", nil)
+	legacyReq := httptest.NewRequest(http.MethodGet, "/api/history?media_type=video", http.NoBody)
 	legacyRes := httptest.NewRecorder()
 	s.handleHistoryList(legacyRes, legacyReq)
 	page = historyListResponse{}
@@ -171,7 +171,7 @@ func TestHistoryAPIContracts(t *testing.T) {
 		t.Fatalf("legacy filtered history = %#v", page)
 	}
 
-	statsReq := httptest.NewRequest(http.MethodGet, "/api/history/stats?type=photo", nil)
+	statsReq := httptest.NewRequest(http.MethodGet, "/api/history/stats?type=photo", http.NoBody)
 	statsRes := httptest.NewRecorder()
 	s.handleHistoryStats(statsRes, statsReq)
 	statsJSON := statsRes.Body.Bytes()
@@ -275,7 +275,7 @@ func TestHistoryPaginationValidationAndCap(t *testing.T) {
 	} {
 		t.Run(query, func(t *testing.T) {
 			res := httptest.NewRecorder()
-			s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?"+query, nil))
+			s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?"+query, http.NoBody))
 			if res.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400 (%s)", res.Code, res.Body.String())
 			}
@@ -286,7 +286,7 @@ func TestHistoryPaginationValidationAndCap(t *testing.T) {
 	s.handleHistoryList(res, httptest.NewRequest(
 		http.MethodGet,
 		fmt.Sprintf("/api/history?page_size=%d", store.MaxHistoryPageSize+1),
-		nil,
+		http.NoBody,
 	))
 	var page historyListResponse
 	if err := json.NewDecoder(res.Body).Decode(&page); err != nil {
@@ -303,7 +303,7 @@ func TestHistoryTotalIsOptional(t *testing.T) {
 	s, _ := newMediaTestServer(t)
 
 	res := httptest.NewRecorder()
-	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history", nil))
+	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history", http.NoBody))
 	var withoutTotal historyListResponse
 	if err := json.NewDecoder(res.Body).Decode(&withoutTotal); err != nil {
 		t.Fatal(err)
@@ -313,7 +313,7 @@ func TestHistoryTotalIsOptional(t *testing.T) {
 	}
 
 	res = httptest.NewRecorder()
-	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?with_total=1", nil))
+	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?with_total=1", http.NoBody))
 	var withTotal historyListResponse
 	if err := json.NewDecoder(res.Body).Decode(&withTotal); err != nil {
 		t.Fatal(err)
@@ -355,7 +355,7 @@ func TestHistoryExportContract(t *testing.T) {
 
 	t.Run("csv", func(t *testing.T) {
 		res := httptest.NewRecorder()
-		s.handleHistoryExport(res, httptest.NewRequest(http.MethodGet, "/api/history/export", nil))
+		s.handleHistoryExport(res, httptest.NewRequest(http.MethodGet, "/api/history/export", http.NoBody))
 		if res.Code != http.StatusOK {
 			t.Fatalf("status = %d (%s)", res.Code, res.Body.String())
 		}
@@ -382,7 +382,7 @@ func TestHistoryExportContract(t *testing.T) {
 	t.Run("json 且筛选生效", func(t *testing.T) {
 		res := httptest.NewRecorder()
 		s.handleHistoryExport(res, httptest.NewRequest(
-			http.MethodGet, "/api/history/export?format=json&type=video", nil))
+			http.MethodGet, "/api/history/export?format=json&type=video", http.NoBody))
 		if res.Code != http.StatusOK {
 			t.Fatalf("status = %d (%s)", res.Code, res.Body.String())
 		}
@@ -398,7 +398,7 @@ func TestHistoryExportContract(t *testing.T) {
 	t.Run("拒绝未知格式", func(t *testing.T) {
 		res := httptest.NewRecorder()
 		s.handleHistoryExport(res, httptest.NewRequest(
-			http.MethodGet, "/api/history/export?format=xlsx", nil))
+			http.MethodGet, "/api/history/export?format=xlsx", http.NoBody))
 		if res.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d，期望 400", res.Code)
 		}
@@ -418,7 +418,7 @@ func TestHistoryTaskIDFilter(t *testing.T) {
 	})
 
 	res := httptest.NewRecorder()
-	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?task_id=task-a", nil))
+	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?task_id=task-a", http.NoBody))
 	var page historyListResponse
 	if err := json.NewDecoder(res.Body).Decode(&page); err != nil {
 		t.Fatal(err)
@@ -447,7 +447,7 @@ func TestHistoryCursorPaginationWalksAllRows(t *testing.T) {
 			q += "&cursor=" + url.QueryEscape(cursor)
 		}
 		res := httptest.NewRecorder()
-		s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, q, nil))
+		s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, q, http.NoBody))
 		if res.Code != http.StatusOK {
 			t.Fatalf("status = %d (%s)", res.Code, res.Body.String())
 		}

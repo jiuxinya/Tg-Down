@@ -13,7 +13,7 @@ import (
 	"tg-down/internal/logger"
 )
 
-func testShell(t *testing.T) (*Shell, string) {
+func testShell(t *testing.T) (shell *Shell, baseURL string) {
 	t.Helper()
 	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -34,15 +34,15 @@ func testShell(t *testing.T) (*Shell, string) {
 	return sh, base
 }
 
-func do(t *testing.T, req *http.Request) (int, string) {
+func do(t *testing.T, req *http.Request) (status int, body string) {
 	t.Helper()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	return resp.StatusCode, string(body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	return resp.StatusCode, string(raw)
 }
 
 // TestShellRejectsForeignOrigin 回归测试：反代必须删掉 Origin 才能让引擎放行，
@@ -140,7 +140,7 @@ func TestDecodeBodyRejectsNonJSON(t *testing.T) {
 // 安全头必须由 UIHandler 自己补齐，否则同一份 SPA 在桌面端完全没有 CSP。
 func TestShellUIHasSecurityHeaders(t *testing.T) {
 	_, base := testShell(t)
-	resp, err := http.Get(base + "/") //nolint:noctx // 测试内的本地请求
+	resp, err := http.Get(base + "/")
 	if err != nil {
 		t.Fatal(err)
 	}

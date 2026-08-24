@@ -15,7 +15,7 @@ import (
 )
 
 // newMediaTestServer 建一个只带 store + 下载根目录的 Server：媒体端点不碰 telegram/queue。
-func newMediaTestServer(t *testing.T) (*Server, string) {
+func newMediaTestServer(t *testing.T) (srv *Server, downloadRoot string) {
 	t.Helper()
 	root := t.TempDir()
 	st, err := store.Open(filepath.Join(t.TempDir(), "media.db"))
@@ -58,7 +58,7 @@ func addRecord(t *testing.T, s *Server, rec *store.HistoryRecord) int64 {
 }
 
 func serveFile(s *Server, id string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodGet, "/api/history/"+id+"/file", nil)
+	r := httptest.NewRequest(http.MethodGet, "/api/history/"+id+"/file", http.NoBody)
 	r.SetPathValue("id", id)
 	w := httptest.NewRecorder()
 	s.handleHistoryFile(w, r)
@@ -66,7 +66,7 @@ func serveFile(s *Server, id string) *httptest.ResponseRecorder {
 }
 
 func serveThumb(s *Server, id string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodGet, "/api/history/"+id+"/thumb", nil)
+	r := httptest.NewRequest(http.MethodGet, "/api/history/"+id+"/thumb", http.NoBody)
 	r.SetPathValue("id", id)
 	w := httptest.NewRecorder()
 	s.handleHistoryThumb(w, r)
@@ -163,7 +163,7 @@ func TestHandleHistoryFile_VideoRangeRemainsAvailable(t *testing.T) {
 		ChatID: 1, MessageID: 1, MediaType: "video", FileName: "video.mp4",
 		FilePath: path, FileSize: 10, MimeType: "video/mp4",
 	})
-	req := httptest.NewRequest(http.MethodGet, "/api/history/1/file", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/history/1/file", http.NoBody)
 	req.SetPathValue("id", strconv.FormatInt(id, 10))
 	req.Header.Set("Range", "bytes=2-5")
 	w := httptest.NewRecorder()
