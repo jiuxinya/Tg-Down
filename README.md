@@ -263,6 +263,10 @@ downloads/
         └── video_4.mp4.json  # save_metadata 开启时的元数据 sidecar
 ```
 
+sidecar 内含该消息的完整信息：文案（caption）、消息 ID、可读日期（`date_text`）、
+聊天 ID/标题、发送者 ID、相册 ID、媒体类型/文件名/大小/MIME、文件唯一 ID（`unique_id`）、
+任务 ID，以及可一键跳回原消息的 `message_url`（`https://t.me/c/<聊天>/<消息>`）。
+
 ### 路径模板
 
 `download.path_template` 可自定义落盘路径。默认值即上方既有布局，不改模板则升级后文件位置不变。
