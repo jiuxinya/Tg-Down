@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks'
 import { api } from '../api'
 import { ALL_TYPES, MEDIA_TYPE_LABEL, fmtTime } from '../format'
+import { ChatSelect } from './ChatSelect'
 import { chatsStore, toast, useStore } from '../store'
 import type { HistoryFilters, Schedule } from '../types'
 
@@ -63,13 +64,10 @@ export function Schedules() {
     <>
       <div class="card">
         <div class="row">
-          <select
-            style="flex:1;min-width:200px" value={String(chatID)}
-            onChange={(e) => setChatID(parseInt(e.currentTarget.value, 10))}
-          >
-            <option value="0">选择聊天…</option>
-            {chats.map((c) => <option key={c.id} value={String(c.id)}>{c.title}</option>)}
-          </select>
+          <ChatSelect
+            value={chatID} onChange={setChatID}
+            placeholder="选择聊天…" style="flex:1;min-width:200px"
+          />
           <label class="meta">
             每
             <input

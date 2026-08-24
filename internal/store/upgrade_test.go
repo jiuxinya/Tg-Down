@@ -81,7 +81,7 @@ func TestOpen_UpgradesLegacyV1Database(t *testing.T) {
 	t.Cleanup(func() { _ = s.Close() })
 
 	// 旧数据仍在，且新列可用
-	items, total, err := s.QueryHistory(context.Background(), &HistoryFilter{})
+	items, total, err := s.queryHistoryLegacy(context.Background(), &HistoryFilter{})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}

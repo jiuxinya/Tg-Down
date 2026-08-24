@@ -44,11 +44,11 @@ func addRecord(t *testing.T, s *Server, rec *store.HistoryRecord) int64 {
 	); err != nil {
 		t.Fatalf("UpdateHistoryResult() error = %v", err)
 	}
-	items, _, err := s.store.QueryHistory(ctx, &store.HistoryFilter{})
+	page, err := s.store.QueryHistory(ctx, &store.HistoryFilter{})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}
-	for _, it := range items {
+	for _, it := range page.Items {
 		if it.ChatID == rec.ChatID && it.MessageID == rec.MessageID {
 			return it.ID
 		}
@@ -276,12 +276,12 @@ func TestHandleHistoryFile_NotCompleted(t *testing.T) {
 	if err := s.store.UpsertHistoryStart(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
-	items, _, err := s.store.QueryHistory(ctx, &store.HistoryFilter{})
-	if err != nil || len(items) != 1 {
-		t.Fatalf("QueryHistory() = %v, err = %v", items, err)
+	page, err := s.store.QueryHistory(ctx, &store.HistoryFilter{})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("QueryHistory() = %v, err = %v", page, err)
 	}
 
-	if w := serveFile(s, strconv.FormatInt(items[0].ID, 10)); w.Code != http.StatusNotFound {
+	if w := serveFile(s, strconv.FormatInt(page.Items[0].ID, 10)); w.Code != http.StatusNotFound {
 		t.Errorf("状态码 = %d, want 404（未完成的下载不该给文件）", w.Code)
 	}
 }

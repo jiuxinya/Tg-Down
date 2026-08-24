@@ -108,9 +108,11 @@ export interface HistoryRecord {
 
 export interface HistoryPage {
   items: HistoryRecord[]
-  total: number
-  page: number
-  page_size: number
+  /** 下一页的不透明游标；空表示已到末页。前端只负责原样回传 */
+  next_cursor?: string
+  /** 仅在请求带 with_total=1 时返回 */
+  total?: number
+  limit: number
 }
 
 export interface MediaTypeStat {
@@ -191,7 +193,13 @@ export interface DesktopInfo {
   goarch: string
   app_dir: string
   autostart: boolean
+  /** 非空表示自启状态查询失败，与"未启用"不是一回事 */
+  autostart_error?: string
   local: string
+}
+
+export interface AutostartState {
+  enabled: boolean
 }
 
 export interface RemoteInstance {

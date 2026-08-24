@@ -3,10 +3,12 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -263,7 +265,12 @@ func TestHandleSchedulesCreateRejectsOverflowingInterval(t *testing.T) {
 
 func TestHistoryPaginationValidationAndCap(t *testing.T) {
 	s, _ := newMediaTestServer(t)
-	for _, query := range []string{"page=0", "page=-1", "page_size=0", "page_size=-1"} {
+	// limit 与旧名 page_size 都要校验；cursor 与 sort 是 v3.2 新增的参数面
+	for _, query := range []string{
+		"limit=0", "limit=-1", "page_size=0", "page_size=-1",
+		"cursor=abc", "cursor=1", "cursor=x.1", "cursor=1.x",
+		"sort=file_name", "sort=" + url.QueryEscape("created_at; DROP TABLE history"),
+	} {
 		t.Run(query, func(t *testing.T) {
 			res := httptest.NewRecorder()
 			s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?"+query, nil))
@@ -283,8 +290,34 @@ func TestHistoryPaginationValidationAndCap(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&page); err != nil {
 		t.Fatal(err)
 	}
-	if res.Code != http.StatusOK || page.PageSize != store.MaxHistoryPageSize {
-		t.Fatalf("response = %d %#v, want capped page size %d", res.Code, page, store.MaxHistoryPageSize)
+	if res.Code != http.StatusOK || page.Limit != store.MaxHistoryPageSize {
+		t.Fatalf("response = %d %#v, want capped limit %d", res.Code, page, store.MaxHistoryPageSize)
+	}
+}
+
+// TestHistoryTotalIsOptional 锁定总数的按需语义：不带 with_total 时不返回总数，
+// 使翻页不再每次都付一遍 COUNT(*) 的代价。
+func TestHistoryTotalIsOptional(t *testing.T) {
+	s, _ := newMediaTestServer(t)
+
+	res := httptest.NewRecorder()
+	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history", nil))
+	var withoutTotal historyListResponse
+	if err := json.NewDecoder(res.Body).Decode(&withoutTotal); err != nil {
+		t.Fatal(err)
+	}
+	if withoutTotal.Total != nil {
+		t.Errorf("未请求总数却返回 %d", *withoutTotal.Total)
+	}
+
+	res = httptest.NewRecorder()
+	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?with_total=1", nil))
+	var withTotal historyListResponse
+	if err := json.NewDecoder(res.Body).Decode(&withTotal); err != nil {
+		t.Fatal(err)
+	}
+	if withTotal.Total == nil {
+		t.Error("请求了 with_total=1 却没有总数")
 	}
 }
 
@@ -305,5 +338,133 @@ func TestMaskPhonePreservesUTF8(t *testing.T) {
 	}
 	if got != "+一二**五六" {
 		t.Fatalf("maskPhone = %q, want %q", got, "+一二**五六")
+	}
+}
+
+// TestHistoryExportContract 覆盖历史导出：两种格式、筛选生效、附件头正确。
+func TestHistoryExportContract(t *testing.T) {
+	s, root := newMediaTestServer(t)
+	addRecord(t, s, &store.HistoryRecord{
+		ChatID: 1, MessageID: 1, MediaType: "photo", FileName: "照片.jpg", FilePath: root + "/a.jpg",
+	})
+	addRecord(t, s, &store.HistoryRecord{
+		ChatID: 1, MessageID: 2, MediaType: "video", FileName: "b.mp4", FilePath: root + "/b.mp4",
+	})
+
+	t.Run("csv", func(t *testing.T) {
+		res := httptest.NewRecorder()
+		s.handleHistoryExport(res, httptest.NewRequest(http.MethodGet, "/api/history/export", nil))
+		if res.Code != http.StatusOK {
+			t.Fatalf("status = %d (%s)", res.Code, res.Body.String())
+		}
+		if cd := res.Header().Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment;") {
+			t.Errorf("Content-Disposition = %q，导出应作为附件下载", cd)
+		}
+		body := res.Body.Bytes()
+		// UTF-8 BOM：缺了它 Excel 会把中文文件名按本地代码页解释成乱码
+		if !bytes.HasPrefix(body, []byte{0xEF, 0xBB, 0xBF}) {
+			t.Error("CSV 缺少 UTF-8 BOM")
+		}
+		rows, err := csv.NewReader(bytes.NewReader(bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF}))).ReadAll()
+		if err != nil {
+			t.Fatalf("CSV 解析失败: %v", err)
+		}
+		if len(rows) != 3 { // 表头 + 2 行
+			t.Fatalf("CSV 行数 = %d，期望表头加两行", len(rows))
+		}
+		if rows[0][0] != "id" || rows[0][6] != "file_name" {
+			t.Errorf("CSV 表头 = %v", rows[0])
+		}
+	})
+
+	t.Run("json 且筛选生效", func(t *testing.T) {
+		res := httptest.NewRecorder()
+		s.handleHistoryExport(res, httptest.NewRequest(
+			http.MethodGet, "/api/history/export?format=json&type=video", nil))
+		if res.Code != http.StatusOK {
+			t.Fatalf("status = %d (%s)", res.Code, res.Body.String())
+		}
+		var dtos []historyRecordDTO
+		if err := json.NewDecoder(res.Body).Decode(&dtos); err != nil {
+			t.Fatal(err)
+		}
+		if len(dtos) != 1 || dtos[0].MediaType != "video" {
+			t.Fatalf("导出结果 = %#v，期望只含 video", dtos)
+		}
+	})
+
+	t.Run("拒绝未知格式", func(t *testing.T) {
+		res := httptest.NewRecorder()
+		s.handleHistoryExport(res, httptest.NewRequest(
+			http.MethodGet, "/api/history/export?format=xlsx", nil))
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d，期望 400", res.Code)
+		}
+	})
+}
+
+// TestHistoryTaskIDFilter 覆盖任务详情下钻：按 task_id 过滤历史。
+func TestHistoryTaskIDFilter(t *testing.T) {
+	s, root := newMediaTestServer(t)
+	addRecord(t, s, &store.HistoryRecord{
+		TaskID: "task-a", ChatID: 1, MessageID: 1, MediaType: "photo",
+		FileName: "a.jpg", FilePath: root + "/a.jpg",
+	})
+	addRecord(t, s, &store.HistoryRecord{
+		TaskID: "task-b", ChatID: 1, MessageID: 2, MediaType: "photo",
+		FileName: "b.jpg", FilePath: root + "/b.jpg",
+	})
+
+	res := httptest.NewRecorder()
+	s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, "/api/history?task_id=task-a", nil))
+	var page historyListResponse
+	if err := json.NewDecoder(res.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].TaskID != "task-a" {
+		t.Fatalf("按 task_id 过滤 = %#v，期望只含 task-a 的记录", page.Items)
+	}
+}
+
+// TestHistoryCursorPaginationWalksAllRows 校验游标翻页不重不漏。
+func TestHistoryCursorPaginationWalksAllRows(t *testing.T) {
+	s, root := newMediaTestServer(t)
+	const rows = 7
+	for i := 1; i <= rows; i++ {
+		addRecord(t, s, &store.HistoryRecord{
+			ChatID: 1, MessageID: int64(i), MediaType: "photo",
+			FileName: fmt.Sprintf("f%d.jpg", i), FilePath: root + "/a.jpg",
+		})
+	}
+
+	seen := map[int64]bool{}
+	cursor := ""
+	for pages := 0; pages < 10; pages++ {
+		q := "/api/history?limit=3"
+		if cursor != "" {
+			q += "&cursor=" + url.QueryEscape(cursor)
+		}
+		res := httptest.NewRecorder()
+		s.handleHistoryList(res, httptest.NewRequest(http.MethodGet, q, nil))
+		if res.Code != http.StatusOK {
+			t.Fatalf("status = %d (%s)", res.Code, res.Body.String())
+		}
+		var page historyListResponse
+		if err := json.NewDecoder(res.Body).Decode(&page); err != nil {
+			t.Fatal(err)
+		}
+		for _, it := range page.Items {
+			if seen[it.ID] {
+				t.Errorf("id=%d 跨页重复", it.ID)
+			}
+			seen[it.ID] = true
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != rows {
+		t.Errorf("游标遍历得到 %d 行，期望 %d", len(seen), rows)
 	}
 }

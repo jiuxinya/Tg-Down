@@ -388,7 +388,7 @@ func TestHistoryUpsertAndUpdateIdempotency(t *testing.T) {
 		t.Fatalf("UpsertHistoryStart() repeat error = %v", err)
 	}
 
-	items, total, err := s.QueryHistory(ctx, &HistoryFilter{ChatID: 100})
+	items, total, err := s.queryHistoryLegacy(ctx, &HistoryFilter{ChatID: 100})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}
@@ -407,7 +407,7 @@ func TestHistoryUpsertAndUpdateIdempotency(t *testing.T) {
 		t.Fatalf("UpdateHistoryResult() repeat error = %v", err)
 	}
 
-	items, total, err = s.QueryHistory(ctx, &HistoryFilter{ChatID: 100})
+	items, total, err = s.queryHistoryLegacy(ctx, &HistoryFilter{ChatID: 100})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}
@@ -438,14 +438,27 @@ func TestQueryHistoryIncludesGalleryMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	items, _, err := s.QueryHistory(ctx, &HistoryFilter{ChatID: 100})
+	items, _, err := s.queryHistoryLegacy(ctx, &HistoryFilter{ChatID: 100})
 	if err != nil || len(items) != 1 {
 		t.Fatalf("QueryHistory() items=%+v err=%v", items, err)
 	}
 	got := items[0]
+	// 列表查询只回传"有无 minithumb"：BLOB 本体每页要搬运数十 KB，而列表接口
+	// 只用它算一个布尔。需要本体的读取路径（媒体端点）走 GetHistoryByID。
 	if got.AlbumID != 77 || got.ThumbPath != "/tmp/thumb.jpg" || got.UniqueID != "unique-8" ||
-		!bytes.Equal(got.Minithumb, mini) {
+		!got.HasMinithumb {
 		t.Fatalf("gallery metadata missing from QueryHistory: %+v", got)
+	}
+	if len(got.Minithumb) != 0 {
+		t.Errorf("列表查询不应取回 minithumb 本体，得到 %d 字节", len(got.Minithumb))
+	}
+
+	full, err := s.GetHistoryByID(ctx, got.ID)
+	if err != nil || full == nil {
+		t.Fatalf("GetHistoryByID() = %+v, err = %v", full, err)
+	}
+	if !bytes.Equal(full.Minithumb, mini) {
+		t.Errorf("按 id 读取应返回 minithumb 本体，得到 %d 字节", len(full.Minithumb))
 	}
 }
 
@@ -490,7 +503,7 @@ func TestUpsertHistoryStart_DoesNotRegressTerminalStatus(t *testing.T) {
 		t.Fatalf("UpsertHistoryStart() repeat-after-completed error = %v", err)
 	}
 
-	items, total, err := s.QueryHistory(ctx, &HistoryFilter{ChatID: 100})
+	items, total, err := s.queryHistoryLegacy(ctx, &HistoryFilter{ChatID: 100})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}
@@ -567,7 +580,7 @@ func TestQueryHistoryFilters(t *testing.T) {
 	seedHistory(t, s, base)
 
 	t.Run("by media type", func(t *testing.T) {
-		items, total, err := s.QueryHistory(ctx, &HistoryFilter{MediaType: "photo"})
+		items, total, err := s.queryHistoryLegacy(ctx, &HistoryFilter{MediaType: "photo"})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
@@ -577,7 +590,7 @@ func TestQueryHistoryFilters(t *testing.T) {
 	})
 
 	t.Run("by chat id", func(t *testing.T) {
-		items, total, err := s.QueryHistory(ctx, &HistoryFilter{ChatID: 2})
+		items, total, err := s.queryHistoryLegacy(ctx, &HistoryFilter{ChatID: 2})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
@@ -587,7 +600,7 @@ func TestQueryHistoryFilters(t *testing.T) {
 	})
 
 	t.Run("by status", func(t *testing.T) {
-		items, total, err := s.QueryHistory(ctx, &HistoryFilter{Status: HistoryStatusCompleted})
+		items, total, err := s.queryHistoryLegacy(ctx, &HistoryFilter{Status: HistoryStatusCompleted})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
@@ -597,7 +610,7 @@ func TestQueryHistoryFilters(t *testing.T) {
 	})
 
 	t.Run("by query substring", func(t *testing.T) {
-		items, total, err := s.QueryHistory(ctx, &HistoryFilter{Query: "jpg"})
+		items, total, err := s.queryHistoryLegacy(ctx, &HistoryFilter{Query: "jpg"})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
@@ -609,7 +622,7 @@ func TestQueryHistoryFilters(t *testing.T) {
 
 	t.Run("by date range", func(t *testing.T) {
 		from := base.Add(90 * time.Second)
-		items, total, err := s.QueryHistory(ctx, &HistoryFilter{From: &from})
+		items, total, err := s.queryHistoryLegacy(ctx, &HistoryFilter{From: &from})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
@@ -617,7 +630,7 @@ func TestQueryHistoryFilters(t *testing.T) {
 			t.Fatalf("total=%d len=%d, want 3", total, len(items))
 		}
 		to := base.Add(90 * time.Second)
-		items, total, err = s.QueryHistory(ctx, &HistoryFilter{To: &to})
+		items, total, err = s.queryHistoryLegacy(ctx, &HistoryFilter{To: &to})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
@@ -626,43 +639,77 @@ func TestQueryHistoryFilters(t *testing.T) {
 		}
 	})
 
-	t.Run("pagination and total", func(t *testing.T) {
-		items, total, err := s.QueryHistory(ctx, &HistoryFilter{Page: 1, PageSize: 2})
+	t.Run("cursor pagination and total", func(t *testing.T) {
+		first, err := s.QueryHistory(ctx, &HistoryFilter{Limit: 2, WithTotal: true})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
-		if total != 5 || len(items) != 2 {
-			t.Fatalf("page1: total=%d len=%d, want total=5 len=2", total, len(items))
+		if first.Total == nil || *first.Total != 5 || len(first.Items) != 2 {
+			t.Fatalf("第一页: total=%v len=%d，期望 total=5 len=2", first.Total, len(first.Items))
 		}
-		// 默认按 created_at 倒序：第一页应是最新的两条 (offset 4min, 3min)
-		if items[0].FileName != "p3.jpg" || items[1].FileName != "d1.pdf" {
-			t.Fatalf("page1 order = [%s, %s], want [p3.jpg, d1.pdf]", items[0].FileName, items[1].FileName)
+		// 默认按 created_at 倒序：第一页应是最新的两条
+		if first.Items[0].FileName != "p3.jpg" || first.Items[1].FileName != "d1.pdf" {
+			t.Fatalf("第一页顺序 = [%s, %s]，期望 [p3.jpg, d1.pdf]",
+				first.Items[0].FileName, first.Items[1].FileName)
+		}
+		if first.NextCursor == nil {
+			t.Fatal("还有后续行时 NextCursor 不应为 nil")
 		}
 
-		items2, total2, err := s.QueryHistory(ctx, &HistoryFilter{Page: 3, PageSize: 2})
+		// 不请求总数时不应返回总数：翻页不该反复付 COUNT(*) 的代价
+		second, err := s.QueryHistory(ctx, &HistoryFilter{Limit: 2, Cursor: first.NextCursor})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
-		if total2 != 5 || len(items2) != 1 {
-			t.Fatalf("page3: total=%d len=%d, want total=5 len=1", total2, len(items2))
+		if second.Total != nil {
+			t.Errorf("未请求总数却返回了 %d", *second.Total)
+		}
+		if len(second.Items) != 2 {
+			t.Fatalf("第二页 len=%d，期望 2", len(second.Items))
 		}
 
-		// PageSize <= 0 应回退默认值且不报错
-		itemsDefault, totalDefault, err := s.QueryHistory(ctx, &HistoryFilter{PageSize: 0})
+		// 游标走到末页：NextCursor 必须为 nil
+		third, err := s.QueryHistory(ctx, &HistoryFilter{Limit: 2, Cursor: second.NextCursor})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
-		if totalDefault != 5 || len(itemsDefault) != 5 {
-			t.Fatalf("default page size: total=%d len=%d, want total=5 len=5", totalDefault, len(itemsDefault))
+		if len(third.Items) != 1 {
+			t.Fatalf("第三页 len=%d，期望 1", len(third.Items))
+		}
+		if third.NextCursor != nil {
+			t.Error("末页仍返回了 NextCursor")
 		}
 
-		// PageSize 超过上限应被截断
-		itemsCapped, _, err := s.QueryHistory(ctx, &HistoryFilter{PageSize: 1000})
+		// 逐页遍历必须不重不漏
+		seen := map[int64]bool{}
+		for _, p := range []*HistoryPage{first, second, third} {
+			for _, rec := range p.Items {
+				if seen[rec.ID] {
+					t.Errorf("id=%d 在多页中重复出现", rec.ID)
+				}
+				seen[rec.ID] = true
+			}
+		}
+		if len(seen) != 5 {
+			t.Errorf("遍历得到 %d 行，期望 5", len(seen))
+		}
+
+		// Limit <= 0 回退默认值
+		def, err := s.QueryHistory(ctx, &HistoryFilter{Limit: 0})
 		if err != nil {
 			t.Fatalf("QueryHistory() error = %v", err)
 		}
-		if len(itemsCapped) != 5 {
-			t.Fatalf("capped page size returned %d items, want 5 (only 5 rows exist)", len(itemsCapped))
+		if len(def.Items) != 5 {
+			t.Fatalf("默认 limit 返回 %d 行，期望 5", len(def.Items))
+		}
+
+		// Limit 超上限应被截断（此处只有 5 行，断言不报错且全量返回）
+		capped, err := s.QueryHistory(ctx, &HistoryFilter{Limit: 1000})
+		if err != nil {
+			t.Fatalf("QueryHistory() error = %v", err)
+		}
+		if len(capped.Items) != 5 {
+			t.Fatalf("超上限 limit 返回 %d 行，期望 5", len(capped.Items))
 		}
 	})
 }
@@ -693,7 +740,7 @@ func TestQueryHistoryTreatsLikeMetacharactersLiterally(t *testing.T) {
 		{query: "!", want: "bang!mark.txt"},
 	} {
 		t.Run(tt.query, func(t *testing.T) {
-			items, total, err := s.QueryHistory(ctx, &HistoryFilter{Query: tt.query})
+			items, total, err := s.queryHistoryLegacy(ctx, &HistoryFilter{Query: tt.query})
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -126,6 +126,23 @@ export const api = {
 
   history: (params: URLSearchParams) => get<HistoryPage>(withToken('/api/history?' + params.toString())),
   historyStats: (params: URLSearchParams) => get<HistoryStatsResponse>(withToken('/api/history/stats?' + params.toString())),
+  // 导出走浏览器下载而非 fetch：响应带 Content-Disposition，交给浏览器直接落盘，
+  // 避免把整份导出读进内存再造一个 blob
+  exportHistory: async (params: URLSearchParams) => {
+    const url = withToken('/api/history/export?' + params.toString())
+    const res = await fetch(url, { credentials: 'same-origin' })
+    if (!res.ok) throw new APIError(await res.text() || `HTTP ${res.status}`, res.status)
+    const blob = await res.blob()
+    const href = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = href
+    a.download = (res.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/)?.[1]
+      || 'history.csv'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(href)
+  },
 
   schedules: () => get<Schedule[]>(withToken('/api/schedules')),
   createSchedule: (body: { chat_id: number; chat_title?: string; interval_min: number; filters?: HistoryFilters }) =>

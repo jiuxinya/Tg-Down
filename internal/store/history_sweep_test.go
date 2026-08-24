@@ -40,7 +40,7 @@ func TestSweepInterruptedHistory(t *testing.T) {
 		t.Fatalf("swept rows = %d, want 2", n)
 	}
 
-	items, _, err := s.QueryHistory(ctx, &HistoryFilter{ChatID: 100})
+	items, _, err := s.queryHistoryLegacy(ctx, &HistoryFilter{ChatID: 100})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}
@@ -93,7 +93,7 @@ func TestUpdateHistoryResult_CompletedNotDowngraded(t *testing.T) {
 		t.Fatalf("UpdateHistoryResult(failed after completed) error = %v", err)
 	}
 
-	items, _, err := s.QueryHistory(ctx, &HistoryFilter{ChatID: 100})
+	items, _, err := s.queryHistoryLegacy(ctx, &HistoryFilter{ChatID: 100})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}
@@ -118,7 +118,7 @@ func TestUpdateHistoryResult_CompletedNotDowngraded(t *testing.T) {
 	if err := s.UpdateHistoryResult(ctx, 200, 1, HistoryStatusCompleted, "", "/tmp/c.jpg"); err != nil {
 		t.Fatalf("UpdateHistoryResult(retry->completed) error = %v", err)
 	}
-	items, _, err = s.QueryHistory(ctx, &HistoryFilter{ChatID: 200})
+	items, _, err = s.queryHistoryLegacy(ctx, &HistoryFilter{ChatID: 200})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}

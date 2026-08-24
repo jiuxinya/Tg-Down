@@ -59,6 +59,9 @@ type HistoryRecord struct {
 	AlbumID    int64  // Telegram 相册 id（media_album_id），0 = 不属于相册
 	ThumbPath  string // 缩略图缓存文件路径（.thumbs/<unique_id>.jpg），无缩略图为空
 	Minithumb  []byte // TDLib 随消息免费返回的极小 JPEG（约 40x40），画廊的即时占位图
+	// HasMinithumb 标记该行是否存在 minithumb。列表查询不取 BLOB 本体：
+	// 它每页要搬运数十 KB，而列表接口只用它算一个"有无缩略图"的布尔。
+	HasMinithumb bool
 }
 
 // 下载历史状态常量，取值与 downloader.RecordStatus 保持一致
@@ -81,11 +84,65 @@ const HistoryReasonInterrupted = "interrupted"
 type HistoryFilter struct {
 	MediaType string
 	Status    string
-	Query     string // 按文件名子串匹配
+	Query     string // 按文件名全文匹配（FTS5）
 	ChatID    int64  // 0 表示不限制
+	TaskID    string // 空 = 不限制；用于任务详情下钻
 	From, To  *time.Time
-	Page      int
-	PageSize  int
+
+	// Cursor 是上一页最后一行的位置，nil = 取第一页。
+	// 用游标而非 LIMIT/OFFSET：深翻页时 OFFSET 要先扫掉前面所有行，代价随页码线性增长；
+	// 且 created_at 是秒级精度，同秒入库的行在无次键排序下顺序不定，翻页可能重复或漏行。
+	Cursor *HistoryCursor
+	Limit  int
+	Sort   HistorySort
+	// WithTotal 为真时才计算匹配总数。COUNT(*) 与列表查询同样要走一遍过滤，
+	// 而翻页时总数不会变，因此只在筛选条件变化的那一次请求里要。
+	WithTotal bool
+}
+
+// HistoryCursor 是 keyset 分页的位置，(排序键, id) 两级保证游标唯一。
+// id 是必需的次键：仅凭秒级的 created_at 无法在同秒的行之间定位。
+type HistoryCursor struct {
+	SortValue int64
+	ID        int64
+}
+
+// HistorySort 是历史列表的排序方式
+type HistorySort string
+
+const (
+	// HistorySortCreatedDesc 是默认排序：最新下载的在前
+	HistorySortCreatedDesc HistorySort = "created_desc"
+	HistorySortCreatedAsc  HistorySort = "created_asc"
+	HistorySortSizeDesc    HistorySort = "size_desc"
+	HistorySortSizeAsc     HistorySort = "size_asc"
+)
+
+// sortColumn 返回该排序方式对应的列与方向；未知取值回落到默认排序。
+// 列名不来自用户输入，只在此处的白名单中取值。
+func (s HistorySort) sortColumn() (column string, descending bool) {
+	switch s {
+	case HistorySortCreatedAsc:
+		return "created_at", false
+	case HistorySortSizeDesc:
+		return "file_size", true
+	case HistorySortSizeAsc:
+		return "file_size", false
+	case HistorySortCreatedDesc:
+		return "created_at", true
+	default:
+		return "created_at", true
+	}
+}
+
+// IsValid 报告是否为受支持的排序方式
+func (s HistorySort) IsValid() bool {
+	switch s {
+	case HistorySortCreatedDesc, HistorySortCreatedAsc, HistorySortSizeDesc, HistorySortSizeAsc:
+		return true
+	default:
+		return false
+	}
 }
 
 // MediaTypeStat 按媒体类型聚合的下载统计

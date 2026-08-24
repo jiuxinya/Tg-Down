@@ -849,10 +849,11 @@ func TestHandleRecordEvent_AsyncPersistPreservesOrder(t *testing.T) {
 	deadline := time.Now().Add(testWaitTimeout)
 	var recs []*store.HistoryRecord
 	for {
-		recs, _, err = m.store.QueryHistory(ctx, &store.HistoryFilter{ChatID: 1})
-		if err != nil {
-			t.Fatalf("QueryHistory() error = %v", err)
+		page, qErr := m.store.QueryHistory(ctx, &store.HistoryFilter{ChatID: 1})
+		if qErr != nil {
+			t.Fatalf("QueryHistory() error = %v", qErr)
 		}
+		recs = page.Items
 		if len(recs) == 1 && recs[0].Status == store.HistoryStatusCompleted {
 			break
 		}

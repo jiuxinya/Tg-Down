@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite" // 注册 database/sql 驱动 "sqlite"
 )
@@ -32,7 +33,8 @@ const (
 	// currentSchemaVersion 是本版本期望的 schema 版本；低于它的库在 Open 时跑一次迁移并打上标记。
 	// v2：history 增加 thumb_path / minithumb（画廊缩略图）。
 	// v3：tasks 增加定时任务恢复与仅补失败文件所需的运行态字段。
-	// v4：schema_version 改为恒定单行；清理过时索引纳入版本闸门。
+	// v4：schema_version 改为恒定单行；清理过时索引纳入版本闸门；
+	//     新增 history_fts 全文索引（文件名搜索）与按大小排序所需的索引。
 	currentSchemaVersion = 4
 )
 
@@ -128,6 +130,38 @@ CREATE INDEX IF NOT EXISTS idx_history_chat_time  ON history(chat_id, created_at
 CREATE INDEX IF NOT EXISTS idx_history_unique_id  ON history(unique_id);
 CREATE INDEX IF NOT EXISTS idx_history_task_id    ON history(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_history_stats      ON history(media_type, status, file_size);
+
+-- 按大小排序的 keyset 分页需要 (file_size, id) 有序；单列索引无法提供 id 次键的定位
+CREATE INDEX IF NOT EXISTS idx_history_size_id    ON history(file_size DESC, id DESC);
+`
+
+// schemaFTS 是文件名全文索引及其同步触发器。
+//
+// external content 表（content='history'）只存倒排索引不复制原文，代价仅为索引本身。
+// 触发器必须覆盖 INSERT/UPDATE/DELETE 三面：UpsertHistoryStart 的 ON CONFLICT 走 UPDATE 分支，
+// 漏掉它会让重扫后的文件名搜不到。UPDATE 触发器带 WHEN 条件——SetHistoryThumb 之类
+// 不改 file_name 的更新每次都重建索引项毫无意义。
+const schemaFTS = `
+CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+  file_name,
+  content='history',
+  content_rowid='id',
+  tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS history_fts_insert AFTER INSERT ON history BEGIN
+  INSERT INTO history_fts(rowid, file_name) VALUES (new.id, new.file_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS history_fts_delete AFTER DELETE ON history BEGIN
+  INSERT INTO history_fts(history_fts, rowid, file_name) VALUES ('delete', old.id, old.file_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS history_fts_update AFTER UPDATE ON history
+WHEN old.file_name IS NOT new.file_name BEGIN
+  INSERT INTO history_fts(history_fts, rowid, file_name) VALUES ('delete', old.id, old.file_name);
+  INSERT INTO history_fts(rowid, file_name) VALUES (new.id, new.file_name);
+END;
 `
 
 // obsoleteIndexes 是被复合索引取代的旧索引：留着只会拖慢每次写入
@@ -140,6 +174,12 @@ var obsoleteIndexes = []string{
 // Store 是基于 SQLite 的持久化句柄
 type Store struct {
 	db *sql.DB
+
+	// statsCache 缓存 HistoryStats 的结果。该查询要按 media_type 分组扫过整个匹配集，
+	// 而历史页每次翻页都会连带请求一次统计。写入路径（execContext）统一使缓存失效，
+	// 因此下载进行中拿到的仍是当前数据，只是同一批筛选条件下的重复请求不再重复扫表。
+	statsMu    sync.RWMutex
+	statsCache map[string][]MediaTypeStat
 }
 
 // Open 打开（或创建）指定路径的 SQLite 数据库并应用 schema。
@@ -198,7 +238,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, statsCache: map[string][]MediaTypeStat{}}, nil
 }
 
 // checkSchemaCompatibility 在执行任何当前版本的 DDL 前拒绝未来版本数据库，避免拒绝打开时
@@ -242,13 +282,30 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	// 之后的 setSchemaVersion 才能按 upsert 写入。
 	for _, step := range []func(context.Context, *sql.DB) error{
 		migrateSchemaVersionTable, migrateTasksTable, migrateHistoryTable, migrateSchedulesTable,
-		dropObsoleteIndexes,
+		dropObsoleteIndexes, migrateHistoryFTS,
 	} {
 		if err := step(ctx, db); err != nil {
 			return err
 		}
 	}
 	return setSchemaVersion(ctx, db, currentSchemaVersion)
+}
+
+// migrateHistoryFTS 建立文件名全文索引并回填既有行。
+//
+// 建表与触发器放在这里而非 schemaTables，是因为回填必须只跑一次：
+// rebuild 会重扫整张 history 表，每次启动都做一遍等于把版本闸门的意义抵消掉。
+// 建表语句本身幂等（IF NOT EXISTS），重复执行无害。
+func migrateHistoryFTS(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, schemaFTS); err != nil {
+		return fmt.Errorf("创建文件名全文索引失败: %w", err)
+	}
+	// 'rebuild' 按 content 表的当前内容重建整个索引，对空表与已有数据的库同样正确
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO history_fts(history_fts) VALUES ('rebuild')`); err != nil {
+		return fmt.Errorf("回填文件名全文索引失败: %w", err)
+	}
+	return nil
 }
 
 // migrateSchemaVersionTable 把早期的追加式版本表改造成恒定单行。
@@ -486,7 +543,21 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// execContext 是内部统一的写操作封装，便于未来扩展（如统一错误包装）
+// execContext 是内部统一的写操作封装：所有写入都经此处，因此在这里统一让
+// 依赖 history 内容的缓存失效，不必在每个写方法里各记一遍。
 func (s *Store) execContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return s.db.ExecContext(ctx, query, args...)
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err == nil {
+		s.invalidateStatsCache()
+	}
+	return res, err
+}
+
+// invalidateStatsCache 清空历史统计缓存
+func (s *Store) invalidateStatsCache() {
+	s.statsMu.Lock()
+	if len(s.statsCache) > 0 {
+		s.statsCache = map[string][]MediaTypeStat{}
+	}
+	s.statsMu.Unlock()
 }
