@@ -1717,17 +1717,10 @@ func (c *Client) resolvePublicChat(ctx context.Context, td tdAPI, username strin
 	return ResolvedTarget{ChatID: chat.Id, Title: chat.Title}, nil
 }
 
-// CountHistoryMedia 统计聊天历史中可下载媒体的总数（服务端近似值）。
-// mediaTypes 非空时只统计选中的类型；日期/大小过滤无法在服务端预估，结果为上估。
+// countMediaByFilter 统计单个过滤器的消息数，经 retrier 调用。
 //
-// 总数要么完整，要么按未知（0）处理，不存在中间态。两条都服务于同一条原则——
-// 宁可没有分母，也不要错的分母：
-//   - 选中的类型里只要有一个无服务端计数能力（贴纸），直接返回未知；
-//   - 任一过滤器经重试仍失败，同样返回未知。此前的做法是跳过失败项、把其余类型的
-//     和当作完整总数返回，于是一次 FLOOD_WAIT 就会产出偏小的分母，进度条冲破 100%。
-//
-// 每个过滤器都经 retrier 调用：GetChatMessageCount 会被服务端限频，裸调时一次 429
-// 就使该类型的计数永久缺失。
+// GetChatMessageCount 会被服务端限频，裸调时一次 429 就使该类型的计数永久缺失——
+// 这是 client.go 里最后一个绕过 retrier 的 TDLib 调用点。
 func (c *Client) countMediaByFilter(ctx context.Context, td tdAPI, chatID int64, f tdclient.SearchMessagesFilter) (*tdclient.Count, error) {
 	var cnt *tdclient.Count
 	err := c.retrier.Do(ctx, func() error {
@@ -1743,6 +1736,15 @@ func (c *Client) countMediaByFilter(ctx context.Context, td tdAPI, chatID int64,
 	})
 	return cnt, err
 }
+
+// CountHistoryMedia 统计聊天历史中可下载媒体的总数（服务端近似值）。
+// mediaTypes 非空时只统计选中的类型；日期/大小过滤无法在服务端预估，结果为上估。
+//
+// 总数要么完整，要么按未知（0）处理，不存在中间态。两条分支服务于同一条原则——
+// 宁可没有分母，也不要错的分母：
+//   - 选中的类型里只要有一个无服务端计数能力（贴纸），直接返回未知；
+//   - 任一过滤器经重试仍失败，同样返回未知。此前的做法是跳过失败项、把其余类型的
+//     和当作完整总数返回，于是一次 FLOOD_WAIT 就会产出偏小的分母，进度条冲破 100%。
 func (c *Client) CountHistoryMedia(ctx context.Context, chatID int64, mediaTypes []string) (int64, error) {
 	td := c.client()
 	if td == nil {

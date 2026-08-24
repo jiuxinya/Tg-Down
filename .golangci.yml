@@ -46,6 +46,7 @@ linters:
             - gopkg.in/yaml.v3
             - modernc.org/sqlite
             - golang.org/x/term
+            - golang.org/x/sys/unix
             - golang.org/x/sys/windows/registry
             # v3.1 桌面客户端依赖：Wails 壳、托盘、系统通知
             - github.com/wailsapp/wails/v2

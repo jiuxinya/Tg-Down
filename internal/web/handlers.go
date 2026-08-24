@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -612,6 +613,12 @@ func (s *Server) handleHistoryStats(w http.ResponseWriter, r *http.Request) {
 // 不设上限时一个百万行的库会把整张表读进内存再吐给浏览器。
 const maxHistoryExportRows = 50_000
 
+// historyExportFormats 是受支持的导出格式
+const (
+	exportFormatCSV  = "csv"
+	exportFormatJSON = "json"
+)
+
 // handleHistoryExport 按当前筛选条件导出下载历史（CSV 或 JSON）。
 //
 // 复用列表的筛选与排序参数，但忽略分页——导出的语义是"这批筛选结果的全部"，
@@ -623,23 +630,42 @@ func (s *Server) handleHistoryExport(w http.ResponseWriter, r *http.Request) {
 	}
 	format := r.URL.Query().Get("format")
 	if format == "" {
-		format = "csv"
+		format = exportFormatCSV
 	}
-	if format != "csv" && format != "json" {
+	if format != exportFormatCSV && format != exportFormatJSON {
 		s.writeError(w, http.StatusBadRequest, "format 仅支持 csv 或 json")
 		return
 	}
 
+	records, err := s.collectHistoryForExport(r.Context(), &filter)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	filename := "tg-down-history-" + time.Now().Format("20060102-150405") + "." + format
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+
+	if format == exportFormatJSON {
+		s.writeHistoryExportJSON(w, records)
+		return
+	}
+	s.writeHistoryExportCSV(w, records)
+}
+
+// collectHistoryForExport 按游标分批取全部匹配行，上限 maxHistoryExportRows
+func (s *Server) collectHistoryForExport(
+	ctx context.Context, filter *store.HistoryFilter,
+) ([]*store.HistoryRecord, error) {
 	filter.Cursor = nil
 	filter.WithTotal = false
 	filter.Limit = store.MaxHistoryPageSize
 
 	records := make([]*store.HistoryRecord, 0, store.MaxHistoryPageSize)
 	for len(records) < maxHistoryExportRows {
-		page, err := s.store.QueryHistory(r.Context(), &filter)
+		page, err := s.store.QueryHistory(ctx, filter)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
-			return
+			return nil, err
 		}
 		records = append(records, page.Items...)
 		if page.NextCursor == nil {
@@ -650,50 +676,57 @@ func (s *Server) handleHistoryExport(w http.ResponseWriter, r *http.Request) {
 	if len(records) > maxHistoryExportRows {
 		records = records[:maxHistoryExportRows]
 	}
+	return records, nil
+}
 
-	filename := "tg-down-history-" + time.Now().Format("20060102-150405") + "." + format
-	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
-
-	if format == "json" {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		dtos := make([]historyRecordDTO, len(records))
-		for i, rec := range records {
-			dtos[i] = toHistoryRecordDTO(rec)
-		}
-		if err := json.NewEncoder(w).Encode(dtos); err != nil {
-			s.logger.Warn("导出历史失败: %v", err)
-		}
-		return
+func (s *Server) writeHistoryExportJSON(w http.ResponseWriter, records []*store.HistoryRecord) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	dtos := make([]historyRecordDTO, len(records))
+	for i, rec := range records {
+		dtos[i] = toHistoryRecordDTO(rec)
 	}
+	if err := json.NewEncoder(w).Encode(dtos); err != nil {
+		s.logger.Warn("导出历史失败: %v", err)
+	}
+}
 
+// historyExportHeader 是 CSV 表头，与 historyExportRow 的字段顺序一一对应
+var historyExportHeader = []string{
+	"id", "task_id", "chat_id", "chat_title", "message_id", "media_type",
+	"file_name", "file_path", "file_size", "mime_type", statusColumnName, "reason",
+	"created_at", "finished_at", "album_id",
+}
+
+// statusColumnName 是导出 CSV 的状态列名
+const statusColumnName = "status"
+
+func historyExportRow(rec *store.HistoryRecord) []string {
+	finished := ""
+	if rec.FinishedAt != nil {
+		finished = rec.FinishedAt.Format(time.RFC3339)
+	}
+	return []string{
+		strconv.FormatInt(rec.ID, 10), rec.TaskID, strconv.FormatInt(rec.ChatID, 10),
+		rec.ChatTitle, strconv.FormatInt(rec.MessageID, 10), rec.MediaType,
+		rec.FileName, rec.FilePath, strconv.FormatInt(rec.FileSize, 10), rec.MimeType,
+		rec.Status, rec.Reason, rec.CreatedAt.Format(time.RFC3339), finished,
+		strconv.FormatInt(rec.AlbumID, 10),
+	}
+}
+
+func (s *Server) writeHistoryExportCSV(w http.ResponseWriter, records []*store.HistoryRecord) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	// UTF-8 BOM：没有它 Excel 会把中文文件名按本地代码页解释成乱码
 	if _, err := w.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
 		return
 	}
 	cw := csv.NewWriter(w)
-	header := []string{
-		"id", "task_id", "chat_id", "chat_title", "message_id", "media_type",
-		"file_name", "file_path", "file_size", "mime_type", "status", "reason",
-		"created_at", "finished_at", "album_id",
-	}
-	if err := cw.Write(header); err != nil {
+	if err := cw.Write(historyExportHeader); err != nil {
 		s.logger.Warn("导出历史失败: %v", err)
 		return
 	}
 	for _, rec := range records {
-		finished := ""
-		if rec.FinishedAt != nil {
-			finished = rec.FinishedAt.Format(time.RFC3339)
-		}
-		row := []string{
-			strconv.FormatInt(rec.ID, 10), rec.TaskID, strconv.FormatInt(rec.ChatID, 10),
-			rec.ChatTitle, strconv.FormatInt(rec.MessageID, 10), rec.MediaType,
-			rec.FileName, rec.FilePath, strconv.FormatInt(rec.FileSize, 10), rec.MimeType,
-			rec.Status, rec.Reason, rec.CreatedAt.Format(time.RFC3339), finished,
-			strconv.FormatInt(rec.AlbumID, 10),
-		}
-		if err := cw.Write(row); err != nil {
+		if err := cw.Write(historyExportRow(rec)); err != nil {
 			s.logger.Warn("导出历史失败: %v", err)
 			return
 		}
@@ -724,26 +757,44 @@ func (s *Server) parseHistoryFilter(w http.ResponseWriter, r *http.Request) (fil
 		}
 		filter.ChatID = chatID
 	}
+	if !s.parseHistoryTimeRange(w, q, &filter) {
+		return filter, false
+	}
+	if !s.parseHistoryPaging(w, q, &filter) {
+		return filter, false
+	}
+	return filter, true
+}
 
+// parseHistoryTimeRange 解析 from/to
+func (s *Server) parseHistoryTimeRange(
+	w http.ResponseWriter, q url.Values, filter *store.HistoryFilter,
+) bool {
 	if t, err := parseHistoryTime(q.Get("from")); err != nil {
 		s.writeError(w, http.StatusBadRequest, "from 格式错误，需为 RFC3339 或 unix 秒")
-		return filter, false
+		return false
 	} else if t != nil {
 		filter.From = t
 	}
 	if t, err := parseHistoryTime(q.Get("to")); err != nil {
 		s.writeError(w, http.StatusBadRequest, "to 格式错误，需为 RFC3339 或 unix 秒")
-		return filter, false
+		return false
 	} else if t != nil {
 		filter.To = t
 	}
+	return true
+}
 
+// parseHistoryPaging 解析排序、每页条数、游标与是否要总数
+func (s *Server) parseHistoryPaging(
+	w http.ResponseWriter, q url.Values, filter *store.HistoryFilter,
+) bool {
 	filter.Sort = store.HistorySortCreatedDesc
 	if v := q.Get("sort"); v != "" {
 		sort := store.HistorySort(v)
 		if !sort.IsValid() {
 			s.writeError(w, http.StatusBadRequest, "sort 取值不受支持")
-			return filter, false
+			return false
 		}
 		filter.Sort = sort
 	}
@@ -758,7 +809,7 @@ func (s *Server) parseHistoryFilter(w http.ResponseWriter, r *http.Request) (fil
 		n, err := strconv.Atoi(sizeParam)
 		if err != nil || n <= 0 {
 			s.writeError(w, http.StatusBadRequest, "limit 格式错误")
-			return filter, false
+			return false
 		}
 		filter.Limit = min(n, store.MaxHistoryPageSize)
 	}
@@ -767,13 +818,12 @@ func (s *Server) parseHistoryFilter(w http.ResponseWriter, r *http.Request) (fil
 		cursor, err := parseHistoryCursor(v)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, "cursor 格式错误")
-			return filter, false
+			return false
 		}
 		filter.Cursor = cursor
 	}
 	filter.WithTotal = q.Get("with_total") == "1"
-
-	return filter, true
+	return true
 }
 
 // encodeHistoryCursor 把游标编码成 "<排序键>.<id>" 的不透明字符串。

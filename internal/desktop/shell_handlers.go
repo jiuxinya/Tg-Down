@@ -40,19 +40,35 @@ type infoDTO struct {
 	GOARCH    string `json:"goarch"`
 	AppDir    string `json:"app_dir"`
 	Autostart bool   `json:"autostart"`
-	Local     string `json:"local"` // 本地引擎根地址（诊断用）
+	// AutostartError 非空表示自启状态查不出来（注册表/文件不可读等）。
+	// 缺这个字段时查询失败与“未启用”在界面上无从区分。
+	AutostartError string `json:"autostart_error,omitempty"`
+	Local          string `json:"local"` // 本地引擎根地址（诊断用）
 }
 
 func (s *Shell) handleInfo(w http.ResponseWriter, _ *http.Request) {
-	enabled, _ := s.autostart.Enabled()
-	writeJSON(w, infoDTO{
+	enabled, err := s.autostart.Enabled()
+	dto := infoDTO{
 		Version:   s.version,
 		GOOS:      goOS(),
 		GOARCH:    goArch(),
 		AppDir:    s.appDir,
 		Autostart: enabled,
 		Local:     s.engineBase,
-	})
+	}
+	if err != nil {
+		dto.AutostartError = err.Error()
+		s.logf("查询开机自启状态失败: %v", err)
+	}
+	writeJSON(w, dto)
+}
+
+// handleShow 唤起主窗口。第二个实例启动时抢锁失败，转而调用本端点把已运行的窗口拉到前台。
+func (s *Shell) handleShow(w http.ResponseWriter, _ *http.Request) {
+	if s.onShow != nil {
+		s.onShow()
+	}
+	writeJSON(w, map[string]string{keyStatus: statusOK})
 }
 
 func (s *Shell) handleList(w http.ResponseWriter, _ *http.Request) {
@@ -98,9 +114,14 @@ func (s *Shell) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	in, err := s.reg.Update(id, deref(body.Name), deref(body.URL), body.Token)
-	if err != nil {
+	in, err := s.reg.Update(id, body.Name, body.URL, body.Token)
+	switch {
+	case errors.Is(err, ErrInstanceNotFound):
 		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	case err != nil:
+		// 名称/地址非法属于请求错误，之前一律报 404 让前端无从区分
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, instanceDTO{ID: in.ID, Name: in.Name, URL: in.URL, HasToken: in.Token != ""})
@@ -108,10 +129,17 @@ func (s *Shell) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Shell) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if err := s.reg.Delete(r.PathValue("id")); err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
+		writeErr(w, statusForRegistryErr(err), err.Error())
 		return
 	}
 	writeJSON(w, map[string]string{keyStatus: statusOK})
+}
+
+func statusForRegistryErr(err error) int {
+	if errors.Is(err, ErrInstanceNotFound) {
+		return http.StatusNotFound
+	}
+	return http.StatusInternalServerError
 }
 
 func (s *Shell) handleSelect(w http.ResponseWriter, r *http.Request) {
@@ -122,7 +150,7 @@ func (s *Shell) handleSelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.reg.Select(body.ID); err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
+		writeErr(w, statusForRegistryErr(err), err.Error())
 		return
 	}
 	writeJSON(w, map[string]string{keyStatus: statusOK, keySelected: body.ID})
@@ -192,6 +220,7 @@ var probeClient = &http.Client{Timeout: probeClientTimeout}
 func (s *Shell) handleAutostartGet(w http.ResponseWriter, _ *http.Request) {
 	enabled, err := s.autostart.Enabled()
 	if err != nil {
+		s.logf("查询开机自启状态失败: %v", err)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -212,15 +241,15 @@ func (s *Shell) handleAutostartSet(w http.ResponseWriter, r *http.Request) {
 		err = s.autostart.Disable()
 	}
 	if err != nil {
+		s.logf("设置开机自启失败: %v", err)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, map[string]bool{keyEnabled: body.Enabled})
-}
-
-func deref(p *string) string {
-	if p == nil {
-		return ""
+	// 回读实际状态而不是回显请求值：写入成功但系统层未生效时界面不该显示成功
+	enabled, err := s.autostart.Enabled()
+	if err != nil {
+		s.logf("回读开机自启状态失败: %v", err)
+		enabled = body.Enabled
 	}
-	return *p
+	writeJSON(w, map[string]bool{keyEnabled: enabled})
 }

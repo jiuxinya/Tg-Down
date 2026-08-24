@@ -401,7 +401,7 @@ FROM history `)
 
 // cursorValue 取出该行的排序键取值，与 sortColumn 的列名一一对应
 func cursorValue(rec *HistoryRecord, sortCol string) int64 {
-	if sortCol == "file_size" {
+	if sortCol == sortColFileSize {
 		return rec.FileSize
 	}
 	return rec.CreatedAt.Unix()

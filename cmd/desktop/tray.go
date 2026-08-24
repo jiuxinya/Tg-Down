@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime"
 	"time"
@@ -32,7 +33,10 @@ func (a *uiApp) onTrayReady(autostart desktop.Autostart) {
 	mPause := systray.AddMenuItem("暂停全部下载", "暂停本地引擎的全部媒体下载")
 	mResume := systray.AddMenuItem("恢复全部下载", "恢复本地引擎的媒体下载")
 	systray.AddSeparator()
-	enabled, _ := autostart.Enabled()
+	enabled, err := autostart.Enabled()
+	if err != nil {
+		a.log.Warn("查询开机自启状态失败，菜单按未启用显示: %v", err)
+	}
 	mAuto := systray.AddMenuItemCheckbox("开机自启", "登录系统时自动启动 Tg-Down", enabled)
 	mUpdate := systray.AddMenuItem("检查更新…", "查询 GitHub 最新发布")
 	systray.AddSeparator()
@@ -43,17 +47,49 @@ func (a *uiApp) onTrayReady(autostart desktop.Autostart) {
 	mResume.Click(func() { a.enginePost("/api/media/resume-all") })
 	mUpdate.Click(a.checkUpdateInteractive)
 	mQuit.Click(a.quit)
-	mAuto.Click(func() {
-		if on, _ := autostart.Enabled(); on {
-			if err := autostart.Disable(); err == nil {
-				mAuto.Uncheck()
-			}
-		} else if err := autostart.Enable(); err == nil {
-			mAuto.Check()
-		} else {
-			_ = beeep.Notify(desktop.AppName, "设置开机自启失败: "+err.Error(), "")
-		}
-	})
+	mAuto.Click(func() { a.toggleAutostart(autostart, mAuto) })
+}
+
+// trayCheckbox 是 systray 复选菜单项中本文件用到的部分，便于测试替身
+type trayCheckbox interface {
+	Check()
+	Uncheck()
+}
+
+// toggleAutostart 切换开机自启，并让复选框严格跟随系统的实际状态。
+// 此前 Disable 失败被完全吞掉：勾选框保持勾上，用户以为关掉了，下次登录照样自启。
+func (a *uiApp) toggleAutostart(autostart desktop.Autostart, item trayCheckbox) {
+	on, err := autostart.Enabled()
+	if err != nil {
+		a.notifyErr("读取开机自启状态失败", err)
+		return
+	}
+	action, verb := autostart.Enable, "开启"
+	if on {
+		action, verb = autostart.Disable, "关闭"
+	}
+	if err := action(); err != nil {
+		a.notifyErr(verb+"开机自启失败", err)
+	}
+	// 无论成败都回读一次：写入部分成功（如 plist 已落盘但 launchctl 报错）时，
+	// 勾选框应显示系统里真正的状态，而不是这次点击的意图。
+	now, err := autostart.Enabled()
+	if err != nil {
+		a.log.Warn("回读开机自启状态失败: %v", err)
+		return
+	}
+	if now {
+		item.Check()
+	} else {
+		item.Uncheck()
+	}
+}
+
+func (a *uiApp) notifyErr(what string, err error) {
+	a.log.Error("%s: %v", what, err)
+	if nerr := beeep.Notify(desktop.AppName, what+": "+err.Error(), ""); nerr != nil {
+		a.log.Debug("系统通知发送失败: %v", nerr)
+	}
 }
 
 // enginePost 调用本地引擎的控制端点（回环无鉴权）
@@ -61,10 +97,19 @@ func (a *uiApp) enginePost(path string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Post(a.engineBase+path, "application/json", bytes.NewReader(nil)) //nolint:noctx // 固定拼接的回环地址
 	if err != nil {
+		a.notifyErr("调用本地引擎失败", err)
 		return
 	}
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		// 静默丢弃状态码时，托盘的暂停/恢复点了没反应也查不出原因
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, engineErrBodyLimit))
+		a.notifyErr("本地引擎拒绝了请求", fmt.Errorf("%s HTTP %d: %s", path, resp.StatusCode, bytes.TrimSpace(body)))
+	}
 }
+
+// engineErrBodyLimit 限制回显的错误正文长度
+const engineErrBodyLimit = 512
 
 func (a *uiApp) checkUpdateInteractive() {
 	go func() {

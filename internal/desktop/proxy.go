@@ -29,7 +29,7 @@ func newInstanceProxy(reg *Registry, id string) (*httputil.ReverseProxy, error) 
 
 	rp := &httputil.ReverseProxy{
 		FlushInterval: -1, // SSE 必需：立即冲刷
-		Transport:     newProxyTransport(),
+		Transport:     proxyTransport(),
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
@@ -76,10 +76,15 @@ func sanitizeErr(err error) string {
 	return s
 }
 
-// newProxyTransport 提供带响应头超时的传输层：SSE 长连接不受读超时影响，
+// proxyTransport 提供带响应头超时的共享传输层：SSE 长连接不受读超时影响，
 // 但连不上/无响应的远端能在有限时间内报错而不是挂死页面。
-func newProxyTransport() *http.Transport {
+//
+// 全进程一份。每个请求各建一个 Transport 时连接池不复用（每次都要重新握手），
+// 且旧 Transport 的空闲连接与协程随实例数线性堆积。
+func proxyTransport() *http.Transport { return sharedProxyTransport }
+
+var sharedProxyTransport = func() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.ResponseHeaderTimeout = 20 * time.Second
 	return t
-}
+}()

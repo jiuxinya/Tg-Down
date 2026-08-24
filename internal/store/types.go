@@ -107,15 +107,24 @@ type HistoryCursor struct {
 	ID        int64
 }
 
+// 排序键对应的列名。取值只在此处白名单内产生，不接受外部输入拼接。
+const (
+	sortColCreatedAt = "created_at"
+	sortColFileSize  = "file_size"
+)
+
 // HistorySort 是历史列表的排序方式
 type HistorySort string
 
 const (
 	// HistorySortCreatedDesc 是默认排序：最新下载的在前
 	HistorySortCreatedDesc HistorySort = "created_desc"
-	HistorySortCreatedAsc  HistorySort = "created_asc"
-	HistorySortSizeDesc    HistorySort = "size_desc"
-	HistorySortSizeAsc     HistorySort = "size_asc"
+	// HistorySortCreatedAsc 按下载时间升序
+	HistorySortCreatedAsc HistorySort = "created_asc"
+	// HistorySortSizeDesc 按文件大小降序
+	HistorySortSizeDesc HistorySort = "size_desc"
+	// HistorySortSizeAsc 按文件大小升序
+	HistorySortSizeAsc HistorySort = "size_asc"
 )
 
 // sortColumn 返回该排序方式对应的列与方向；未知取值回落到默认排序。
@@ -123,15 +132,15 @@ const (
 func (s HistorySort) sortColumn() (column string, descending bool) {
 	switch s {
 	case HistorySortCreatedAsc:
-		return "created_at", false
+		return sortColCreatedAt, false
 	case HistorySortSizeDesc:
-		return "file_size", true
+		return sortColFileSize, true
 	case HistorySortSizeAsc:
-		return "file_size", false
+		return sortColFileSize, false
 	case HistorySortCreatedDesc:
-		return "created_at", true
+		return sortColCreatedAt, true
 	default:
-		return "created_at", true
+		return sortColCreatedAt, true
 	}
 }
 
