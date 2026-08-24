@@ -77,8 +77,13 @@ jobs:
       - name: Run go vet
         run: go vet -tags "desktop,production,webkit2_41" ./...
 
+      # 标签集必须与上面的 vet 一致：不一致会让 cmd/desktop 编译出两套，
+      # 而被测的那套缺 Wails 的 production 标签，等于没测到发布形态
+      - name: Run web tests
+        run: cd web && npm test
+
       - name: Run tests
-        run: go test -race -cover -tags "webkit2_41" ./...
+        run: go test -race -cover -tags "desktop,production,webkit2_41" ./...
 
       - name: Build application
         run: |
@@ -163,7 +168,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Run tests
-        run: go test ./...
+        run: go test -race -cover ./...
 
       - name: Build application
         run: |
@@ -175,6 +180,43 @@ jobs:
         with:
           name: tg-down-windows
           path: tg-down.exe
+
+  build-macos:
+    runs-on: macos-14
+    name: Build and Test macOS
+    # 此前 CI 完全没有 macOS 作业：autostart_darwin.go、dmg 打包路径这些平台专属代码
+    # 只有在打 tag 触发 release 时才第一次被编译，问题要到发布当天才暴露。
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        run: cd web && npm ci --no-audit --no-fund && npm run build
+
+      - name: Setup TDLib
+        uses: ./.github/actions/setup-tdlib
+
+      - name: Run tests
+        run: go test -race -cover ./...
+
+      - name: Build desktop client
+        run: |
+          # Darwin 链接需要 UniformTypeIdentifiers（拖放 API），与 Makefile 保持一致
+          export CGO_LDFLAGS="$CGO_LDFLAGS -framework UniformTypeIdentifiers"
+          go build -tags "desktop,production" -o /dev/null ./cmd/desktop
 
   dependency-submission:
     runs-on: ubuntu-latest

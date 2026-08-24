@@ -15,7 +15,7 @@ import (
 )
 
 // newMediaTestServer 建一个只带 store + 下载根目录的 Server：媒体端点不碰 telegram/queue。
-func newMediaTestServer(t *testing.T) (*Server, string) {
+func newMediaTestServer(t *testing.T) (srv *Server, downloadRoot string) {
 	t.Helper()
 	root := t.TempDir()
 	st, err := store.Open(filepath.Join(t.TempDir(), "media.db"))
@@ -44,11 +44,11 @@ func addRecord(t *testing.T, s *Server, rec *store.HistoryRecord) int64 {
 	); err != nil {
 		t.Fatalf("UpdateHistoryResult() error = %v", err)
 	}
-	items, _, err := s.store.QueryHistory(ctx, &store.HistoryFilter{})
+	page, err := s.store.QueryHistory(ctx, &store.HistoryFilter{})
 	if err != nil {
 		t.Fatalf("QueryHistory() error = %v", err)
 	}
-	for _, it := range items {
+	for _, it := range page.Items {
 		if it.ChatID == rec.ChatID && it.MessageID == rec.MessageID {
 			return it.ID
 		}
@@ -58,7 +58,7 @@ func addRecord(t *testing.T, s *Server, rec *store.HistoryRecord) int64 {
 }
 
 func serveFile(s *Server, id string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodGet, "/api/history/"+id+"/file", nil)
+	r := httptest.NewRequest(http.MethodGet, "/api/history/"+id+"/file", http.NoBody)
 	r.SetPathValue("id", id)
 	w := httptest.NewRecorder()
 	s.handleHistoryFile(w, r)
@@ -66,7 +66,7 @@ func serveFile(s *Server, id string) *httptest.ResponseRecorder {
 }
 
 func serveThumb(s *Server, id string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodGet, "/api/history/"+id+"/thumb", nil)
+	r := httptest.NewRequest(http.MethodGet, "/api/history/"+id+"/thumb", http.NoBody)
 	r.SetPathValue("id", id)
 	w := httptest.NewRecorder()
 	s.handleHistoryThumb(w, r)
@@ -163,7 +163,7 @@ func TestHandleHistoryFile_VideoRangeRemainsAvailable(t *testing.T) {
 		ChatID: 1, MessageID: 1, MediaType: "video", FileName: "video.mp4",
 		FilePath: path, FileSize: 10, MimeType: "video/mp4",
 	})
-	req := httptest.NewRequest(http.MethodGet, "/api/history/1/file", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/history/1/file", http.NoBody)
 	req.SetPathValue("id", strconv.FormatInt(id, 10))
 	req.Header.Set("Range", "bytes=2-5")
 	w := httptest.NewRecorder()
@@ -276,12 +276,12 @@ func TestHandleHistoryFile_NotCompleted(t *testing.T) {
 	if err := s.store.UpsertHistoryStart(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
-	items, _, err := s.store.QueryHistory(ctx, &store.HistoryFilter{})
-	if err != nil || len(items) != 1 {
-		t.Fatalf("QueryHistory() = %v, err = %v", items, err)
+	page, err := s.store.QueryHistory(ctx, &store.HistoryFilter{})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("QueryHistory() = %v, err = %v", page, err)
 	}
 
-	if w := serveFile(s, strconv.FormatInt(items[0].ID, 10)); w.Code != http.StatusNotFound {
+	if w := serveFile(s, strconv.FormatInt(page.Items[0].ID, 10)); w.Code != http.StatusNotFound {
 		t.Errorf("状态码 = %d, want 404（未完成的下载不该给文件）", w.Code)
 	}
 }

@@ -106,7 +106,8 @@ deps:
 # 清理构建文件
 clean:
 	@echo "正在清理构建文件..."
-	@rm -f tg-down tg-down.exe
+	@rm -f tg-down tg-down.exe tg-down-desktop tg-down-desktop.exe desktop
+	@rm -rf dist
 	@echo "清理完成！"
 
 # 安装到系统路径
@@ -133,6 +134,11 @@ help:
 	@echo "  make run       - 编译并运行程序"
 	@echo "  make test      - 运行全部测试（需先 make tdlib）"
 	@echo "  make test-fast - 快速单测（不需要 TDLib）"
+	@echo "  make test-integration - 真实账号集成测试（需 TG_DOWN_IT_* 环境变量）"
+	@echo "  make web       - 构建前端（Vite）"
+	@echo "  make web-dev   - 前端开发服务器（热更新）"
+	@echo "  make build-desktop   - 编译桌面客户端（Wails）"
+	@echo "  make package-desktop - 打包桌面发布产物"
 	@echo "  make deps    - 下载依赖"
 	@echo "  make clean   - 清理构建文件"
 	@echo "  make install - 安装到系统路径"

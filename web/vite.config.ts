@@ -34,9 +34,18 @@ export default defineConfig({
     },
   },
   server: {
-    // 开发时把 API 代理到本地 Go 服务，前端可用 npm run dev 热更新
+    // 开发时把 API 代理到本地 Go 服务，前端可用 npm run dev 热更新。
+    // /desktop/api 也要代理：桌面壳的端点此前不在代理表里，npm run dev 下
+    // 实例管理与自启开关完全没法调试。
     proxy: {
       '/api': 'http://127.0.0.1:8080',
+      '/desktop/api': 'http://127.0.0.1:8080',
     },
+  },
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./src/test/setup.ts'],
+    include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
   },
 })

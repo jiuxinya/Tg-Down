@@ -61,7 +61,25 @@ type task struct {
 	lastRecordNotify      time.Time // 上次下载记录对外推送时刻，用于限频
 	recordTrailingPending bool      // 是否已排定一次尾随推送（限频窗口内多次更新只排一次）
 	restoreErr            string    // 持久化运行参数损坏时阻止自动恢复和无过滤重试
+
+	// rateSamples 是任务级速率的滑动窗口采样，按文件完成时的累计字节数记点。
+	// downloader 的速度是全局值（所有任务共用一个分子），任务卡片需要自己这一份。
+	rateSamples []taskRateSample
 }
+
+// taskRateSample 是某一时刻该任务累计已下载字节数的采样点
+type taskRateSample struct {
+	at    time.Time
+	bytes int64
+}
+
+const (
+	// taskSpeedWindow 是任务速率的滑动窗口长度。取值明显大于 downloader 的 5s：
+	// 任务级采样点只在文件完成时产生，大文件之间可以间隔很久，窗口太短会让速度频繁归零。
+	taskSpeedWindow = 30 * time.Second
+	// taskRateMaxSamples 是窗口内保留的采样点上限，防止大量小文件瞬间完成时无限增长
+	taskRateMaxSamples = 256
+)
 
 // scanNotifyMinGap 是扫描进度对外推送（SSE）的最小间隔：
 // 本地缓存命中时历史页可毫秒级连续返回，不限频会造成广播风暴
@@ -192,7 +210,10 @@ func (t *task) toDTOLocked() TaskDTO {
 		f := cloneHistoryFilters(t.filters)
 		filters = &f
 	}
+	speedBps, etaSeconds := t.speedAndETALocked(time.Now())
 	return TaskDTO{
+		SpeedBps:        speedBps,
+		ETASeconds:      etaSeconds,
 		Filters:         filters,
 		MessageID:       t.messageID,
 		ID:              t.id,
@@ -281,7 +302,69 @@ func (t *task) applyRecordEvent(evt *downloader.RecordEvent) {
 		} else {
 			t.stats.DownloadedSize += evt.Media.FileSize
 		}
+		t.noteRateLocked(time.Now())
 	case downloader.RecordFailed:
 		t.stats.Failed++
 	}
+}
+
+// noteRateLocked 记录一个任务级速率采样点；调用方必须已持有 t.mu。
+func (t *task) noteRateLocked(now time.Time) {
+	t.rateSamples = append(t.rateSamples, taskRateSample{at: now, bytes: t.stats.DownloadedSize})
+	t.pruneRateLocked(now)
+}
+
+func (t *task) pruneRateLocked(now time.Time) {
+	cut := 0
+	for cut < len(t.rateSamples) && now.Sub(t.rateSamples[cut].at) > taskSpeedWindow {
+		cut++
+	}
+	t.rateSamples = t.rateSamples[cut:]
+	if over := len(t.rateSamples) - taskRateMaxSamples; over > 0 {
+		t.rateSamples = t.rateSamples[over:]
+	}
+}
+
+// speedAndETALocked 返回任务级速度（字节/秒）与预计剩余秒数；调用方必须已持有 t.mu。
+//
+// 速度取滑动窗口内累计字节的增量除以时间跨度。只有运行中的任务才报速度：终态任务的
+// 窗口里可能还留着最后几个采样点，继续报出去会让已完成的任务卡片显示一个虚假的速率。
+//
+// ETA 需要一个可信的分母。expectedTotal 在带日期/大小/关键词/发送者过滤时恒为 0，
+// 贴纸任务与计数失败时同样为 0；此时只报速度不报 ETA，而不是拿错的总数算出一个错的
+// 剩余时间——与进度条"宁可没有分母，也不要错的分母"是同一条原则。
+func (t *task) speedAndETALocked(now time.Time) (speedBps, etaSeconds int64) {
+	if t.status != StatusRunning {
+		return 0, 0
+	}
+	t.pruneRateLocked(now)
+	if len(t.rateSamples) < 2 {
+		return 0, 0
+	}
+	oldest := t.rateSamples[0]
+	newest := t.rateSamples[len(t.rateSamples)-1]
+	elapsed := newest.at.Sub(oldest.at).Seconds()
+	if elapsed <= 0 {
+		return 0, 0
+	}
+	speedBps = int64(float64(newest.bytes-oldest.bytes) / elapsed)
+	if speedBps <= 0 {
+		return 0, 0
+	}
+
+	// 剩余文件数按"总数 - 已终结"估算，再乘以已完成文件的平均大小换成字节。
+	total := t.expectedTotal
+	if total <= 0 {
+		total = int64(t.stats.Total)
+	}
+	done := int64(t.stats.Downloaded + t.stats.Skipped + t.stats.Failed)
+	if total <= 0 || done <= 0 || done >= total {
+		return speedBps, 0
+	}
+	avgSize := t.stats.DownloadedSize / int64(max(t.stats.Downloaded, 1))
+	if avgSize <= 0 {
+		return speedBps, 0
+	}
+	remainBytes := (total - done) * avgSize
+	return speedBps, remainBytes / speedBps
 }

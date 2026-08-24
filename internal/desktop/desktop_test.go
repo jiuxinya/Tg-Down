@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"tg-down/internal/logger"
 )
 
 func TestNormalizeBaseURL(t *testing.T) {
@@ -49,7 +51,7 @@ func TestRegistryCRUDAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.Update(in.ID, "", "", strPtr("secret-token")); err != nil {
+	if _, err := reg.Update(in.ID, nil, nil, strPtr("secret-token")); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.Select(in.ID); err != nil {
@@ -123,7 +125,7 @@ func TestProxyDirectorRewritesRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reg.Update(in.ID, "", "", strPtr("tok-1234")); err != nil {
+	if _, err := reg.Update(in.ID, nil, nil, strPtr("tok-1234")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,7 +134,7 @@ func TestProxyDirectorRewritesRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "http://shell.local/api/remote/"+in.ID+"/api/history/7/thumb?token=localjunk&x=1", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://shell.local/api/remote/"+in.ID+"/api/history/7/thumb?token=localjunk&x=1", http.NoBody)
 	req.Header.Set("Origin", "http://shell.local")
 	req.Header.Set("Cookie", "tg_down_web_auth=zzz")
 	rp.Director(req)
@@ -174,7 +176,7 @@ func TestLocalEngineProxyDirector(t *testing.T) {
 	}
 	rp := localEngineProxy(target).(*httputil.ReverseProxy)
 
-	req := httptest.NewRequest(http.MethodPost, "http://shell.local/api/settings?token=eng-token", nil)
+	req := httptest.NewRequest(http.MethodPost, "http://shell.local/api/settings?token=eng-token", http.NoBody)
 	req.Header.Set("Origin", "http://shell.local")
 	req.Header.Set("Referer", "http://shell.local/settings")
 	req.Header.Set("Cookie", "tg_down_web_auth=zzz")
@@ -212,7 +214,7 @@ func TestShellRoutesLocalAPIToEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shell := NewShell(reg, engine.URL, t.TempDir(), "test", stubAutostart{})
+	shell := NewShell(reg, engine.URL, t.TempDir(), "test", stubAutostart{}, logger.New("error"))
 	base, err := shell.Start(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +225,7 @@ func TestShellRoutesLocalAPIToEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"state":"ready"`) {
 		t.Fatalf("/api/state 未转发到引擎: HTTP %d, body=%s", resp.StatusCode, body)

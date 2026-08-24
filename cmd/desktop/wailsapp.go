@@ -14,16 +14,18 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"tg-down/internal/desktop"
+	"tg-down/internal/logger"
 )
 
 // wailsRun 间接引用 wails.Run，便于测试替换
-func wailsRun(opts *options.App) error { return wails.Run(opts) }
+var wailsRun = wails.Run
 
 // uiApp 承载 Wails 生命周期回调与托盘动作
 type uiApp struct {
 	ctx        atomic.Pointer[context.Context]
 	shellURL   string
 	engineBase string
+	log        *logger.Logger
 }
 
 // storeCtx 在 OnStartup 里记录运行时上下文；托盘动作据此操作窗口

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -14,6 +15,12 @@ import (
 
 // LocalInstanceID 是内置本地实例的保留 ID；远程实例不得占用
 const LocalInstanceID = "local"
+
+// ErrInstanceNotFound 用于把“实例不存在”与参数非法区分开：前者是 404，后者是 400
+var ErrInstanceNotFound = errors.New("实例不存在")
+
+// ErrInvalidInstanceURL 表示地址不是可用的 http(s) 根地址
+var ErrInvalidInstanceURL = errors.New("实例地址无效")
 
 // Instance 描述一个可管理的下载实例。本地实例不入注册表，由壳层动态合成。
 type Instance struct {
@@ -82,13 +89,31 @@ func (r *Registry) normalizeLocked() {
 	sort.Slice(kept, func(i, j int) bool { return kept[i].Name < kept[j].Name })
 }
 
+// saveLocked 原子落盘：先写临时文件并 fsync，再 rename 覆盖。
+// 少了 fsync 的话，崩溃/断电后 rename 可能先于数据落到介质，注册表会变成空洞文件，
+// 全部远程实例与令牌一起丢失。
 func (r *Registry) saveLocked() error {
 	data, err := json.MarshalIndent(&r.data, "", "  ")
 	if err != nil {
 		return err
 	}
 	tmp := r.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // path 由应用数据目录拼出
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, r.path)
@@ -121,7 +146,7 @@ func (r *Registry) Get(id string) (Instance, bool) {
 func (r *Registry) Add(name, rawURL string) (Instance, error) {
 	u := NormalizeBaseURL(rawURL)
 	if u == "" {
-		return Instance{}, fmt.Errorf("实例地址无效")
+		return Instance{}, ErrInvalidInstanceURL
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -133,16 +158,23 @@ func (r *Registry) Add(name, rawURL string) (Instance, error) {
 	if in.Name == "" {
 		in.Name = u
 	}
-	r.data.Instances = append(r.data.Instances, in)
+	before := r.data.Instances
+	r.data.Instances = append(append([]*Instance{}, before...), in)
 	r.normalizeLocked()
 	if err := r.saveLocked(); err != nil {
+		r.data.Instances = before
 		return Instance{}, err
 	}
 	return *in, nil
 }
 
-// Update 就地修改实例；token 为 nil 表示保持不变，非 nil（可为空串）表示覆写
-func (r *Registry) Update(id, name, rawURL string, token *string) (Instance, error) {
+// Update 就地修改实例。三个可选字段一律 nil 表示保持不变、非 nil 表示覆写：
+// name 覆写为空串是明确的错误（此前空串与“不修改”不可区分，改名成空是静默无操作），
+// token 覆写为空串则是合法的“清除令牌”。
+//
+// 全部校验在改动内存之前完成，落盘失败时回滚：否则一次非法地址或一次写盘失败
+// 就会让内存与磁盘分叉，界面显示的值与重启后的值不一致。
+func (r *Registry) Update(id string, name, rawURL, token *string) (Instance, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var target *Instance
@@ -153,23 +185,32 @@ func (r *Registry) Update(id, name, rawURL string, token *string) (Instance, err
 		}
 	}
 	if target == nil {
-		return Instance{}, fmt.Errorf("实例不存在: %s", id)
+		return Instance{}, fmt.Errorf("%w: %s", ErrInstanceNotFound, id)
 	}
-	if name != "" {
-		target.Name = strings.TrimSpace(name)
-	}
-	if rawURL != "" {
-		u := NormalizeBaseURL(rawURL)
-		if u == "" {
-			return Instance{}, fmt.Errorf("实例地址无效")
+
+	newName := target.Name
+	if name != nil {
+		if newName = strings.TrimSpace(*name); newName == "" {
+			return Instance{}, errors.New("实例名称不能为空")
 		}
-		target.URL = u
 	}
+	newURL := target.URL
+	if rawURL != nil {
+		if newURL = NormalizeBaseURL(*rawURL); newURL == "" {
+			return Instance{}, ErrInvalidInstanceURL
+		}
+	}
+	newToken := target.Token
 	if token != nil {
-		target.Token = strings.TrimSpace(*token)
+		newToken = strings.TrimSpace(*token)
 	}
+
+	before := *target
+	target.Name, target.URL, target.Token = newName, newURL, newToken
 	r.normalizeLocked()
 	if err := r.saveLocked(); err != nil {
+		*target = before
+		r.normalizeLocked()
 		return Instance{}, err
 	}
 	return *target, nil
@@ -179,7 +220,7 @@ func (r *Registry) Update(id, name, rawURL string, token *string) (Instance, err
 func (r *Registry) Delete(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	kept := r.data.Instances[:0]
+	kept := make([]*Instance, 0, len(r.data.Instances))
 	found := false
 	for _, in := range r.data.Instances {
 		if in.ID == id {
@@ -189,14 +230,19 @@ func (r *Registry) Delete(id string) error {
 		kept = append(kept, in)
 	}
 	if !found {
-		return fmt.Errorf("实例不存在: %s", id)
+		return fmt.Errorf("%w: %s", ErrInstanceNotFound, id)
 	}
+	beforeList, beforeSel := r.data.Instances, r.data.Selected
 	r.data.Instances = kept
 	if r.data.Selected == id {
 		r.data.Selected = LocalInstanceID
 	}
 	r.normalizeLocked()
-	return r.saveLocked()
+	if err := r.saveLocked(); err != nil {
+		r.data.Instances, r.data.Selected = beforeList, beforeSel
+		return err
+	}
+	return nil
 }
 
 // Selected 返回当前选中的实例 ID（local 或远程 ID）
@@ -219,11 +265,16 @@ func (r *Registry) Select(id string) error {
 			}
 		}
 		if !found {
-			return fmt.Errorf("实例不存在: %s", id)
+			return fmt.Errorf("%w: %s", ErrInstanceNotFound, id)
 		}
 	}
+	before := r.data.Selected
 	r.data.Selected = id
-	return r.saveLocked()
+	if err := r.saveLocked(); err != nil {
+		r.data.Selected = before
+		return err
+	}
+	return nil
 }
 
 // newID 生成 8 字节随机十六进制 ID

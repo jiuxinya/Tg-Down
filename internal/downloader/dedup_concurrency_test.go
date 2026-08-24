@@ -55,7 +55,7 @@ func TestDuplicateCopy_RespectsConcurrencyLimit(t *testing.T) {
 		go func() {
 			defer runWG.Done()
 			media := &MediaInfo{
-				MessageID: int64(i), TDFileID: int32(i), UniqueID: "dup", //nolint:gosec // 测试用小整数
+				MessageID: int64(i), TDFileID: int32(i), UniqueID: "dup",
 				MediaType: "document", FileName: "f" + string(rune('a'+i)) + ".bin", FileSize: 7, ChatID: 100,
 			}
 			_ = d.DownloadMedia(context.Background(), media)

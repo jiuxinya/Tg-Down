@@ -4,8 +4,9 @@ import {
   ALL_TYPES, MEDIA_TYPE_LABEL, TASK_STATUS_LABEL,
   fmtDuration, fmtSize, fmtSpeed, fmtTime, pct,
 } from '../format'
+import { ChatSelect } from './ChatSelect'
 import {
-  chatsStore, loadTasks, refreshChats, stateStore, tasksStore, toast, useStore,
+  chatsStore, historyFocusStore, loadTasks, stateStore, tasksStore, toast, useStore,
 } from '../store'
 import type { HistoryFilters, MediaProgress, Task } from '../types'
 
@@ -31,7 +32,6 @@ function NewTask() {
   const chats = useStore(chatsStore)
   const tasks = useStore(tasksStore)
   const [chatID, setChatID] = useState(0)
-  const [chatQuery, setChatQuery] = useState('')
   const [link, setLink] = useState('')
   const [showFilters, setShowFilters] = useState(false)
   const [types, setTypes] = useState<string[]>([])
@@ -41,11 +41,7 @@ function NewTask() {
   const [query, setQuery] = useState('')
   const [sender, setSender] = useState('')
   const [busy, setBusy] = useState(false)
-  const [refreshing, setRefreshing] = useState(false)
 
-  const visibleChats = chats.filter((chat) => (
-    !chatQuery.trim() || chat.title.toLowerCase().includes(chatQuery.trim().toLowerCase())
-  ))
   const activeMonitor = tasks.find((task) => (
     task.kind === 'monitor' && task.chat_id === chatID &&
     (task.status === 'queued' || task.status === 'running')
@@ -115,18 +111,6 @@ function NewTask() {
     }
   }
 
-  const reloadChats = async () => {
-    setRefreshing(true)
-    try {
-      await refreshChats()
-      toast('聊天列表已刷新')
-    } catch (e) {
-      toast((e as Error).message)
-    } finally {
-      setRefreshing(false)
-    }
-  }
-
   const doExport = async () => {
     if (!chatID) { toast('请先选择聊天'); return }
     const raw = prompt('最多导出多少条消息？（0 = 全部；大频道建议先试 1000）', '1000')
@@ -154,20 +138,10 @@ function NewTask() {
   return (
     <div class="card">
       <div class="row">
-        <input
-          style="min-width:180px" type="search" placeholder="搜索聊天…"
-          value={chatQuery} onInput={(e) => setChatQuery(e.currentTarget.value)}
+        <ChatSelect
+          value={chatID} onChange={setChatID} placeholder="选择聊天…"
+          searchable refreshable style="flex:1;min-width:200px"
         />
-        <select
-          style="flex:1;min-width:200px" value={String(chatID)}
-          onChange={(e) => setChatID(parseInt(e.currentTarget.value, 10))}
-        >
-          <option value="0">选择聊天…</option>
-          {visibleChats.map((c) => <option key={c.id} value={String(c.id)}>{c.title}</option>)}
-        </select>
-        <button class="sm" disabled={refreshing} onClick={() => void reloadChats()}>
-          {refreshing ? '刷新中…' : '刷新聊天'}
-        </button>
         <button class="accent" disabled={busy} onClick={() => void create('history')}>下载历史媒体</button>
         {activeMonitor ? (
           <button class="danger" disabled={busy} onClick={() => void stopMonitor()}>停止监控</button>
@@ -294,6 +268,14 @@ function TaskCard({ task: t }: { task: Task }) {
         <span class="meta">{t.kind === 'monitor' ? '实时监控' : '历史下载'}</span>
         <span class="grow" />
         <span class="meta">{fmtTime(t.created_at)}</span>
+        {done > 0 && (
+          <button
+            class="sm" title="在历史页查看本任务下载的文件"
+            onClick={() => historyFocusStore.set(t.id)}
+          >
+            查看文件
+          </button>
+        )}
         {(t.status === 'queued' || t.status === 'running') && (
           <button class="sm danger" onClick={() => api.cancelTask(t.id).then(loadTasks).catch((e) => toast(e.message))}>
             取消
@@ -330,6 +312,8 @@ function TaskCard({ task: t }: { task: Task }) {
             {s.failed > 0 && <span style="color:var(--err)">失败 {s.failed}</span>}
             <span>共 {total || '?'}</span>
             <span class="grow" />
+            {t.speed_bps ? <span>{fmtSpeed(t.speed_bps)}</span> : null}
+            {t.eta_seconds ? <span>剩余 {fmtDuration(t.eta_seconds)}</span> : null}
             <span>{fmtSize(s.downloaded_size)}</span>
           </div>
         </>

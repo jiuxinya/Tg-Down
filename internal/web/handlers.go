@@ -2,11 +2,13 @@ package web
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +49,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/media/resume-all", s.handleMediaResumeAll)
 	mux.HandleFunc("GET /api/history", s.handleHistoryList)
 	mux.HandleFunc("GET /api/history/stats", s.handleHistoryStats)
+	mux.HandleFunc("GET /api/history/export", s.handleHistoryExport)
 	mux.HandleFunc("GET /api/history/{id}/file", s.handleHistoryFile)
 	mux.HandleFunc("GET /api/history/{id}/thumb", s.handleHistoryThumb)
 	mux.HandleFunc("POST /api/export", s.handleExport)
@@ -567,27 +570,30 @@ func (s *Server) chatTitle(chatID int64) string {
 }
 
 func (s *Server) handleHistoryList(w http.ResponseWriter, r *http.Request) {
-	filter, page, pageSize, ok := s.parseHistoryFilter(w, r)
+	filter, ok := s.parseHistoryFilter(w, r)
 	if !ok {
 		return
 	}
-	filter.Page = page
-	filter.PageSize = pageSize
 
-	items, total, err := s.store.QueryHistory(r.Context(), &filter)
+	page, err := s.store.QueryHistory(r.Context(), &filter)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	dtos := make([]historyRecordDTO, len(items))
-	for i, rec := range items {
+	dtos := make([]historyRecordDTO, len(page.Items))
+	for i, rec := range page.Items {
 		dtos[i] = toHistoryRecordDTO(rec)
 	}
-	s.writeJSON(w, historyListResponse{Items: dtos, Total: total, Page: page, PageSize: pageSize})
+	s.writeJSON(w, historyListResponse{
+		Items:      dtos,
+		NextCursor: encodeHistoryCursor(page.NextCursor),
+		Total:      page.Total,
+		Limit:      filter.Limit,
+	})
 }
 
 func (s *Server) handleHistoryStats(w http.ResponseWriter, r *http.Request) {
-	filter, _, _, ok := s.parseHistoryFilter(w, r)
+	filter, ok := s.parseHistoryFilter(w, r)
 	if !ok {
 		return
 	}
@@ -603,9 +609,137 @@ func (s *Server) handleHistoryStats(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, historyStatsResponse{ByType: dtos})
 }
 
+// maxHistoryExportRows 是单次导出的行数上限：导出走的是同步响应，
+// 不设上限时一个百万行的库会把整张表读进内存再吐给浏览器。
+const maxHistoryExportRows = 50_000
+
+// historyExportFormats 是受支持的导出格式
+const (
+	exportFormatCSV  = "csv"
+	exportFormatJSON = "json"
+)
+
+// handleHistoryExport 按当前筛选条件导出下载历史（CSV 或 JSON）。
+//
+// 复用列表的筛选与排序参数，但忽略分页——导出的语义是"这批筛选结果的全部"，
+// 而非"当前这一页"。内部按游标分批取，避免一次性把匹配集读进内存。
+func (s *Server) handleHistoryExport(w http.ResponseWriter, r *http.Request) {
+	filter, ok := s.parseHistoryFilter(w, r)
+	if !ok {
+		return
+	}
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = exportFormatCSV
+	}
+	if format != exportFormatCSV && format != exportFormatJSON {
+		s.writeError(w, http.StatusBadRequest, "format 仅支持 csv 或 json")
+		return
+	}
+
+	records, err := s.collectHistoryForExport(r.Context(), &filter)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	filename := "tg-down-history-" + time.Now().Format("20060102-150405") + "." + format
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+
+	if format == exportFormatJSON {
+		s.writeHistoryExportJSON(w, records)
+		return
+	}
+	s.writeHistoryExportCSV(w, records)
+}
+
+// collectHistoryForExport 按游标分批取全部匹配行，上限 maxHistoryExportRows
+func (s *Server) collectHistoryForExport(
+	ctx context.Context, filter *store.HistoryFilter,
+) ([]*store.HistoryRecord, error) {
+	filter.Cursor = nil
+	filter.WithTotal = false
+	filter.Limit = store.MaxHistoryPageSize
+
+	records := make([]*store.HistoryRecord, 0, store.MaxHistoryPageSize)
+	for len(records) < maxHistoryExportRows {
+		page, err := s.store.QueryHistory(ctx, filter)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, page.Items...)
+		if page.NextCursor == nil {
+			break
+		}
+		filter.Cursor = page.NextCursor
+	}
+	if len(records) > maxHistoryExportRows {
+		records = records[:maxHistoryExportRows]
+	}
+	return records, nil
+}
+
+func (s *Server) writeHistoryExportJSON(w http.ResponseWriter, records []*store.HistoryRecord) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	dtos := make([]historyRecordDTO, len(records))
+	for i, rec := range records {
+		dtos[i] = toHistoryRecordDTO(rec)
+	}
+	if err := json.NewEncoder(w).Encode(dtos); err != nil {
+		s.logger.Warn("导出历史失败: %v", err)
+	}
+}
+
+// historyExportHeader 是 CSV 表头，与 historyExportRow 的字段顺序一一对应
+var historyExportHeader = []string{
+	"id", "task_id", "chat_id", "chat_title", "message_id", "media_type",
+	"file_name", "file_path", "file_size", "mime_type", statusColumnName, "reason",
+	"created_at", "finished_at", "album_id",
+}
+
+// statusColumnName 是导出 CSV 的状态列名
+const statusColumnName = "status"
+
+func historyExportRow(rec *store.HistoryRecord) []string {
+	finished := ""
+	if rec.FinishedAt != nil {
+		finished = rec.FinishedAt.Format(time.RFC3339)
+	}
+	return []string{
+		strconv.FormatInt(rec.ID, 10), rec.TaskID, strconv.FormatInt(rec.ChatID, 10),
+		rec.ChatTitle, strconv.FormatInt(rec.MessageID, 10), rec.MediaType,
+		rec.FileName, rec.FilePath, strconv.FormatInt(rec.FileSize, 10), rec.MimeType,
+		rec.Status, rec.Reason, rec.CreatedAt.Format(time.RFC3339), finished,
+		strconv.FormatInt(rec.AlbumID, 10),
+	}
+}
+
+func (s *Server) writeHistoryExportCSV(w http.ResponseWriter, records []*store.HistoryRecord) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	// UTF-8 BOM：没有它 Excel 会把中文文件名按本地代码页解释成乱码
+	if _, err := w.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
+		return
+	}
+	cw := csv.NewWriter(w)
+	if err := cw.Write(historyExportHeader); err != nil {
+		s.logger.Warn("导出历史失败: %v", err)
+		return
+	}
+	for _, rec := range records {
+		if err := cw.Write(historyExportRow(rec)); err != nil {
+			s.logger.Warn("导出历史失败: %v", err)
+			return
+		}
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		s.logger.Warn("导出历史失败: %v", err)
+	}
+}
+
 // parseHistoryFilter 解析 /api/history 与 /api/history/stats 共用的查询参数；
 // from/to 接受 RFC3339 或 unix 秒两种格式
-func (s *Server) parseHistoryFilter(w http.ResponseWriter, r *http.Request) (filter store.HistoryFilter, page, pageSize int, ok bool) {
+func (s *Server) parseHistoryFilter(w http.ResponseWriter, r *http.Request) (filter store.HistoryFilter, ok bool) {
 	q := r.URL.Query()
 	filter.MediaType = q.Get("type")
 	if filter.MediaType == "" {
@@ -613,48 +747,109 @@ func (s *Server) parseHistoryFilter(w http.ResponseWriter, r *http.Request) (fil
 	}
 	filter.Status = q.Get("status")
 	filter.Query = q.Get("q")
+	filter.TaskID = q.Get("task_id")
 
 	if v := q.Get("chat_id"); v != "" {
 		chatID, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, "chat_id 格式错误")
-			return filter, 0, 0, false
+			return filter, false
 		}
 		filter.ChatID = chatID
 	}
+	if !s.parseHistoryTimeRange(w, q, &filter) {
+		return filter, false
+	}
+	if !s.parseHistoryPaging(w, q, &filter) {
+		return filter, false
+	}
+	return filter, true
+}
 
+// parseHistoryTimeRange 解析 from/to
+func (s *Server) parseHistoryTimeRange(
+	w http.ResponseWriter, q url.Values, filter *store.HistoryFilter,
+) bool {
 	if t, err := parseHistoryTime(q.Get("from")); err != nil {
 		s.writeError(w, http.StatusBadRequest, "from 格式错误，需为 RFC3339 或 unix 秒")
-		return filter, 0, 0, false
+		return false
 	} else if t != nil {
 		filter.From = t
 	}
 	if t, err := parseHistoryTime(q.Get("to")); err != nil {
 		s.writeError(w, http.StatusBadRequest, "to 格式错误，需为 RFC3339 或 unix 秒")
-		return filter, 0, 0, false
+		return false
 	} else if t != nil {
 		filter.To = t
 	}
+	return true
+}
 
-	page = 1
-	if v := q.Get("page"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			s.writeError(w, http.StatusBadRequest, "page 格式错误")
-			return filter, 0, 0, false
+// parseHistoryPaging 解析排序、每页条数、游标与是否要总数
+func (s *Server) parseHistoryPaging(
+	w http.ResponseWriter, q url.Values, filter *store.HistoryFilter,
+) bool {
+	filter.Sort = store.HistorySortCreatedDesc
+	if v := q.Get("sort"); v != "" {
+		sort := store.HistorySort(v)
+		if !sort.IsValid() {
+			s.writeError(w, http.StatusBadRequest, "sort 取值不受支持")
+			return false
 		}
-		page = n
+		filter.Sort = sort
 	}
-	pageSize = store.DefaultHistoryPageSize
-	if v := q.Get("page_size"); v != "" {
-		n, err := strconv.Atoi(v)
+
+	filter.Limit = store.DefaultHistoryPageSize
+	// page_size 是 v3.1 及更早前端的参数名，与 limit 等价，一并接受
+	sizeParam := q.Get("limit")
+	if sizeParam == "" {
+		sizeParam = q.Get("page_size")
+	}
+	if sizeParam != "" {
+		n, err := strconv.Atoi(sizeParam)
 		if err != nil || n <= 0 {
-			s.writeError(w, http.StatusBadRequest, "page_size 格式错误")
-			return filter, 0, 0, false
+			s.writeError(w, http.StatusBadRequest, "limit 格式错误")
+			return false
 		}
-		pageSize = min(n, store.MaxHistoryPageSize)
+		filter.Limit = min(n, store.MaxHistoryPageSize)
 	}
-	return filter, page, pageSize, true
+
+	if v := q.Get("cursor"); v != "" {
+		cursor, err := parseHistoryCursor(v)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "cursor 格式错误")
+			return false
+		}
+		filter.Cursor = cursor
+	}
+	filter.WithTotal = q.Get("with_total") == "1"
+	return true
+}
+
+// encodeHistoryCursor 把游标编码成 "<排序键>.<id>" 的不透明字符串。
+// 前端只负责原样回传，不解析其含义，因此排序键换列也不影响前端。
+func encodeHistoryCursor(c *store.HistoryCursor) string {
+	if c == nil {
+		return ""
+	}
+	return strconv.FormatInt(c.SortValue, 10) + "." + strconv.FormatInt(c.ID, 10)
+}
+
+// parseHistoryCursor 解析 encodeHistoryCursor 的产物
+func parseHistoryCursor(v string) (*store.HistoryCursor, error) {
+	sortValue, id, found := strings.Cut(v, ".")
+	if !found {
+		return nil, fmt.Errorf("游标缺少分隔符")
+	}
+	sv, err := strconv.ParseInt(sortValue, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	rowID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &store.HistoryCursor{SortValue: sv, ID: rowID}, nil
 }
 
 // parseHistoryTime 解析 RFC3339 或 unix 秒时间戳，空串返回 nil
@@ -754,10 +949,14 @@ func toHistoryRecordDTO(rec *store.HistoryRecord) historyRecordDTO {
 }
 
 type historyListResponse struct {
-	Items    []historyRecordDTO `json:"items"`
-	Total    int                `json:"total"`
-	Page     int                `json:"page"`
-	PageSize int                `json:"page_size"`
+	Items []historyRecordDTO `json:"items"`
+	// NextCursor 是下一页的不透明游标，空串表示已到末页。
+	// 前端原样回传即可，不需要理解其内部结构。
+	NextCursor string `json:"next_cursor,omitempty"`
+	// Total 仅在请求带 with_total=1 时有值：COUNT(*) 要走一遍完整匹配集，
+	// 而翻页时总数不变，因此只在筛选条件变化的那一次请求里要。
+	Total *int `json:"total,omitempty"`
+	Limit int  `json:"limit"`
 }
 
 type mediaTypeStatDTO struct {

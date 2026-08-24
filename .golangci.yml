@@ -46,6 +46,7 @@ linters:
             - gopkg.in/yaml.v3
             - modernc.org/sqlite
             - golang.org/x/term
+            - golang.org/x/sys/unix
             - golang.org/x/sys/windows/registry
             # v3.1 桌面客户端依赖：Wails 壳、托盘、系统通知
             - github.com/wailsapp/wails/v2
@@ -119,10 +120,21 @@ linters:
   exclusions:
     generated: lax
     rules:
+      # 测试代码纳入 lint（此前整体豁免，约 8600 行不受任何检查），但以下几类
+      # 在测试里属于结构性噪声而非缺陷，逐项豁免而非整体放行：
+      #   gosec  测试固件刻意用宽松权限与临时路径，不构成风险面
+      #   noctx  httptest 请求不带 ctx 是惯用写法
+      #   gocyclo 表驱动用例天然分支多
+      #   lll    固件里的长字面量
+      #   dupl/goconst/mnd 被测值在各用例里各写一次，本就该重复
       - linters:
           - dupl
           - goconst
+          - gocyclo
+          - gosec
+          - lll
           - mnd
+          - noctx
         path: _test\.go
       - linters:
           - gochecknoinits
@@ -133,12 +145,8 @@ linters:
           - gosec
           - mnd
         path: ^scripts/
-      - linters:
-          - unparam
-        text: parameter .* seems to be unused
     paths:
       - .*\.pb\.go$
-      - .*_test.go
       - vendor
       - third_party$
       - builtin$
@@ -158,7 +166,6 @@ formatters:
     generated: lax
     paths:
       - .*\.pb\.go$
-      - .*_test.go
       - vendor
       - third_party$
       - builtin$

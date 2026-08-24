@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -101,6 +102,16 @@ FROM history WHERE id = ?`
 // 落败一方的 RecordFailed 可能晚于胜出一方的 RecordCompleted 到达，文件其实已存在），
 // 但 failed -> completed（重试成功）仍允许，保持重试语义。
 func (s *Store) UpdateHistoryResult(ctx context.Context, chatID, messageID int64, status, reason, filePath string) error {
+	return s.UpdateHistoryResultWithThumb(ctx, chatID, messageID, status, reason, filePath, "")
+}
+
+// UpdateHistoryResultWithThumb 在写终态的同一条语句里一并记录缩略图路径。
+//
+// 缩略图与终态在下载完成的同一时刻就都已知，分两条语句写等于每个媒体多付一次
+// 独立事务的提交开销；thumbPath 为空时该列保持不变，因此失败/跳过路径可以共用这条语句。
+func (s *Store) UpdateHistoryResultWithThumb(
+	ctx context.Context, chatID, messageID int64, status, reason, filePath, thumbPath string,
+) error {
 	const q = `
 	UPDATE history SET
 	  status = CASE WHEN status = 'completed' AND ? = 1 THEN status ELSE ? END,
@@ -109,6 +120,7 @@ func (s *Store) UpdateHistoryResult(ctx context.Context, chatID, messageID int64
 	    WHEN status = 'completed' AND ? = 1 THEN file_path
 	    ELSE COALESCE(NULLIF(?, ''), file_path)
 	  END,
+	  thumb_path = COALESCE(NULLIF(?, ''), thumb_path),
 	  finished_at = CASE
 	    WHEN status = 'completed' AND ? = 1 THEN finished_at
 	    WHEN ? = 1 THEN ?
@@ -122,6 +134,7 @@ func (s *Store) UpdateHistoryResult(ctx context.Context, chatID, messageID int64
 		protectCompleted, status,
 		protectCompleted, nullString(reason),
 		protectCompleted, filePath,
+		thumbPath,
 		protectCompleted, isTerminal, time.Now().Unix(),
 		chatID, messageID)
 	if err != nil {
@@ -222,12 +235,27 @@ func historyFilterClause(f *HistoryFilter) (where string, args []any) {
 		args = append(args, f.Status)
 	}
 	if f.Query != "" {
-		conds = append(conds, "file_name LIKE ? ESCAPE '!'")
-		args = append(args, "%"+escapeLikePattern(f.Query)+"%")
+		// 走 FTS5 倒排索引而非 LIKE '%q%'：前置通配符使 LIKE 必然全表扫描，
+		// 十万行量级下每次搜索都要读完整张表。
+		//
+		// unicode61 分词器不索引标点，因此纯标点的查询（"%"、"_"）在 FTS 里没有词元可查。
+		// 这类查询回退到 LIKE：它们本就罕见，全表扫一次的代价可以接受，
+		// 而"能按文件名里的字面标点搜索"这一既有能力不该因为换索引而消失。
+		if match := ftsMatchQuery(f.Query); match != "" {
+			conds = append(conds, "id IN (SELECT rowid FROM history_fts WHERE file_name MATCH ?)")
+			args = append(args, match)
+		} else {
+			conds = append(conds, "file_name LIKE ? ESCAPE '!'")
+			args = append(args, "%"+escapeLikePattern(f.Query)+"%")
+		}
 	}
 	if f.ChatID != 0 {
 		conds = append(conds, "chat_id = ?")
 		args = append(args, f.ChatID)
+	}
+	if f.TaskID != "" {
+		conds = append(conds, "task_id = ?")
+		args = append(args, f.TaskID)
 	}
 	if f.From != nil {
 		conds = append(conds, "created_at >= ?")
@@ -249,63 +277,160 @@ func escapeLikePattern(s string) string {
 	return strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(s)
 }
 
-// QueryHistory 按过滤条件分页查询下载历史，total 为忽略分页的匹配总数
-func (s *Store) QueryHistory(ctx context.Context, f *HistoryFilter) ([]*HistoryRecord, int, error) {
+// ftsMatchQuery 把用户输入转成 FTS5 的前缀匹配表达式；无可索引词元时返回空串，
+// 由调用方回退到 LIKE。
+//
+// 用户在搜索框里输入的是文件名片段，不是 FTS 查询语法。直接把原文交给 MATCH，
+// 其中的 "、*、:、^、AND/OR/NOT 等会被当作运算符——轻则查不到，重则语法错误报 500。
+// 因此把每个词整体加双引号变成字面量短语，再补 * 做前缀匹配（搜 "vid" 能命中 "video.mp4"）。
+// 内部的双引号按 FTS5 规则用两个双引号转义。
+func ftsMatchQuery(s string) string {
+	terms := make([]string, 0, 4)
+	for _, field := range strings.Fields(s) {
+		// 剥掉词元首尾的标点：unicode61 不索引它们，留着会让短语匹配不到任何词元
+		trimmed := strings.TrimFunc(field, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		})
+		if trimmed == "" {
+			continue
+		}
+		terms = append(terms, `"`+strings.ReplaceAll(trimmed, `"`, `""`)+`"*`)
+	}
+	if len(terms) == 0 {
+		return ""
+	}
+	return strings.Join(terms, " ")
+}
+
+// HistoryPage 是一页下载历史及其游标。
+type HistoryPage struct {
+	Items []*HistoryRecord
+	// NextCursor 是下一页的起点，nil 表示已到末页
+	NextCursor *HistoryCursor
+	// Total 是忽略分页的匹配总数，仅在请求 WithTotal 时有值
+	Total *int
+}
+
+// QueryHistory 按过滤条件取一页下载历史。
+//
+// 分页用 keyset 而非 LIMIT/OFFSET：翻到第 N 页时 OFFSET 仍要先扫掉前面 (N-1)*size 行，
+// 代价随页码线性增长；游标则每页都是一次索引定位。排序键恒定带上 id 作次键，
+// 否则同一秒入库的多行在 created_at 上并列，翻页时可能重复或漏掉。
+func (s *Store) QueryHistory(ctx context.Context, f *HistoryFilter) (*HistoryPage, error) {
 	where, args := historyFilterClause(f)
 
-	var total int
-	var countQ strings.Builder
-	countQ.WriteString("SELECT COUNT(*) FROM history ")
-	countQ.WriteString(where)
-	if err := s.db.QueryRowContext(ctx, countQ.String(), args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("统计下载历史总数失败: %w", err)
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultHistoryPageSize
+	}
+	if limit > MaxHistoryPageSize {
+		limit = MaxHistoryPageSize
 	}
 
-	pageSize := f.PageSize
-	if pageSize <= 0 {
-		pageSize = DefaultHistoryPageSize
-	}
-	if pageSize > MaxHistoryPageSize {
-		pageSize = MaxHistoryPageSize
-	}
-	page := f.Page
-	if page <= 0 {
-		page = 1
-	}
-	offset := (page - 1) * pageSize
+	sortCol, desc := f.Sort.sortColumn()
+	queryArgs := append([]any{}, args...)
 
 	var q strings.Builder
+	// 不取 minithumb BLOB：列表接口只用它算"有无缩略图"，取回本体等于每页白搬数十 KB
 	q.WriteString(`SELECT id, task_id, chat_id, chat_title, message_id, media_type, file_name, file_path,
 	       file_size, mime_type, status, reason, created_at, finished_at, unique_id, album_id,
-	       thumb_path, minithumb
+	       thumb_path, (minithumb IS NOT NULL AND length(minithumb) > 0)
 FROM history `)
 	q.WriteString(where)
-	q.WriteString(` ORDER BY created_at DESC LIMIT ? OFFSET ?`)
-	queryArgs := append(append([]any{}, args...), pageSize, offset)
+
+	if f.Cursor != nil {
+		cmp := "<"
+		if !desc {
+			cmp = ">"
+		}
+		// 行值比较而非展开成 (col < ? OR (col = ? AND id < ?))：后者是等价的布尔表达式，
+		// 但 SQLite 无法把带 OR 的形式收敛成一次索引区间扫描，深翻页会退化成近似全表扫描
+		// （实测第 75000 行处相差一个数量级）。(col, id) < (?, ?) 则直接定位到索引上的一点。
+		clause := fmt.Sprintf("(%s, id) %s (?, ?)", sortCol, cmp)
+		if where == "" {
+			q.WriteString(" WHERE " + clause)
+		} else {
+			q.WriteString(" AND " + clause)
+		}
+		queryArgs = append(queryArgs, f.Cursor.SortValue, f.Cursor.ID)
+	}
+
+	dir := "DESC"
+	if !desc {
+		dir = "ASC"
+	}
+	// 多取一行用来判断还有没有下一页，返回前丢弃
+	fmt.Fprintf(&q, " ORDER BY %s %s, id %s LIMIT ?", sortCol, dir, dir)
+	queryArgs = append(queryArgs, limit+1)
 
 	rows, err := s.db.QueryContext(ctx, q.String(), queryArgs...)
 	if err != nil {
-		return nil, 0, fmt.Errorf("查询下载历史失败: %w", err)
+		return nil, fmt.Errorf("查询下载历史失败: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	var items []*HistoryRecord
 	for rows.Next() {
-		rec, err := scanHistoryRow(rows)
+		rec, err := scanHistoryListRow(rows)
 		if err != nil {
-			return nil, 0, fmt.Errorf("解析下载历史失败: %w", err)
+			return nil, fmt.Errorf("解析下载历史失败: %w", err)
 		}
 		items = append(items, rec)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("遍历下载历史失败: %w", err)
+		return nil, fmt.Errorf("遍历下载历史失败: %w", err)
 	}
-	return items, total, nil
+
+	page := &HistoryPage{}
+	if len(items) > limit {
+		items = items[:limit]
+		last := items[len(items)-1]
+		page.NextCursor = &HistoryCursor{SortValue: cursorValue(last, sortCol), ID: last.ID}
+	}
+	page.Items = items
+
+	if f.WithTotal {
+		total, err := s.historyTotal(ctx, where, args)
+		if err != nil {
+			return nil, err
+		}
+		page.Total = &total
+	}
+	return page, nil
 }
 
-// HistoryStats 按 media_type 分组统计下载历史，过滤条件与 QueryHistory 一致（忽略分页）
+// cursorValue 取出该行的排序键取值，与 sortColumn 的列名一一对应
+func cursorValue(rec *HistoryRecord, sortCol string) int64 {
+	if sortCol == sortColFileSize {
+		return rec.FileSize
+	}
+	return rec.CreatedAt.Unix()
+}
+
+// historyTotal 统计匹配总数（忽略分页）
+func (s *Store) historyTotal(ctx context.Context, where string, args []any) (int, error) {
+	var total int
+	q := "SELECT COUNT(*) FROM history " + where
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("统计下载历史总数失败: %w", err)
+	}
+	return total, nil
+}
+
+// HistoryStats 按 media_type 分组统计下载历史，过滤条件与 QueryHistory 一致（忽略分页）。
+//
+// 结果按筛选条件缓存：这条查询要扫过整个匹配集做分组聚合，而历史页每次翻页都会连带请求
+// 一次统计（分页变了但统计不变）。任何写入都会清空缓存，因此下载进行中读到的仍是当前数据。
 func (s *Store) HistoryStats(ctx context.Context, f *HistoryFilter) ([]MediaTypeStat, error) {
 	where, args := historyFilterClause(f)
+	cacheKey := statsCacheKey(where, args)
+
+	s.statsMu.RLock()
+	cached, ok := s.statsCache[cacheKey]
+	s.statsMu.RUnlock()
+	if ok {
+		return append([]MediaTypeStat(nil), cached...), nil
+	}
 
 	var q strings.Builder
 	q.WriteString(`SELECT media_type,
@@ -335,7 +460,29 @@ FROM history `)
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("遍历下载历史统计失败: %w", err)
 	}
+
+	s.statsMu.Lock()
+	// 缓存条目数按筛选组合增长，给个上限防止被大量不同筛选撑大
+	if len(s.statsCache) >= maxStatsCacheEntries {
+		s.statsCache = map[string][]MediaTypeStat{}
+	}
+	s.statsCache[cacheKey] = append([]MediaTypeStat(nil), stats...)
+	s.statsMu.Unlock()
+
 	return stats, nil
+}
+
+// maxStatsCacheEntries 是统计缓存的条目上限
+const maxStatsCacheEntries = 64
+
+// statsCacheKey 由 WHERE 子句与其实参构成，两个筛选条件相同的请求才会命中同一条缓存
+func statsCacheKey(where string, args []any) string {
+	var b strings.Builder
+	b.WriteString(where)
+	for _, a := range args {
+		fmt.Fprintf(&b, "\x00%v", a)
+	}
+	return b.String()
 }
 
 // scanHistoryRow 从单行结果解析出 HistoryRecord
@@ -364,6 +511,38 @@ func scanHistoryRow(row scanner) (*HistoryRecord, error) {
 	rec.UniqueID = uniqueID.String
 	rec.ThumbPath = thumbPath.String
 	rec.Minithumb = minithumb
+	rec.HasMinithumb = len(minithumb) > 0
+	rec.CreatedAt = unixToTime(createdAt)
+	rec.FinishedAt = nullInt64ToTimePtr(finishedAt)
+	return &rec, nil
+}
+
+// scanHistoryListRow 解析列表查询的一行：末列是"有无 minithumb"的布尔而非 BLOB 本体。
+func scanHistoryListRow(row scanner) (*HistoryRecord, error) {
+	var (
+		rec                             HistoryRecord
+		taskID, chatTitle, mime, reason sql.NullString
+		uniqueID, thumbPath             sql.NullString
+		createdAt                       int64
+		finishedAt                      sql.NullInt64
+		hasMinithumb                    bool
+	)
+
+	if err := row.Scan(
+		&rec.ID, &taskID, &rec.ChatID, &chatTitle, &rec.MessageID, &rec.MediaType, &rec.FileName,
+		&rec.FilePath, &rec.FileSize, &mime, &rec.Status, &reason, &createdAt, &finishedAt,
+		&uniqueID, &rec.AlbumID, &thumbPath, &hasMinithumb,
+	); err != nil {
+		return nil, err
+	}
+
+	rec.TaskID = taskID.String
+	rec.ChatTitle = chatTitle.String
+	rec.MimeType = mime.String
+	rec.Reason = reason.String
+	rec.UniqueID = uniqueID.String
+	rec.ThumbPath = thumbPath.String
+	rec.HasMinithumb = hasMinithumb
 	rec.CreatedAt = unixToTime(createdAt)
 	rec.FinishedAt = nullInt64ToTimePtr(finishedAt)
 	return &rec, nil

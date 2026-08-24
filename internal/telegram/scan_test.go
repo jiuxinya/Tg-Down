@@ -82,9 +82,13 @@ func TestScanHistoryPages_DoesNotTreatProgressingEmptyPagesAsComplete(t *testing
 		}
 	}}
 	var got []*downloader.MediaInfo
-	res, err := c.scanHistoryPages(
-		context.Background(), fake, &downloader.HistorySpec{ChatID: 1}, collectDispatch(&got),
-	)
+	// 固定为贴纸：它无服务端过滤器，因而只有一条管线，页数与调用次数一一对应，
+	// 断言"空页推进不算扫完"这一意图不被多管线的页数叠加干扰。
+	spec := &downloader.HistorySpec{
+		ChatID:  1,
+		Filters: downloader.HistoryFilters{MediaTypes: []string{mediapkg.Sticker}},
+	}
+	res, err := c.scanHistoryPages(context.Background(), fake, spec, collectDispatch(&got))
 	if err != nil {
 		t.Fatalf("scanHistoryPages() error = %v", err)
 	}
@@ -209,29 +213,24 @@ func TestScanHistoryPages_UsesServerSearch(t *testing.T) {
 	}
 }
 
-// TestScanHistoryPages_DownloadAllUsesOneUnfilteredPipeline 断言"下载全部"使用一条无过滤
-// 搜索流水线。默认类型含贴纸，拆成专用过滤器会漏贴纸；单条完整历史流水线也不会重复消息。
-func TestScanHistoryPages_DownloadAllUsesOneUnfilteredPipeline(t *testing.T) {
+// TestScanHistoryPages_DownloadAllUsesServerFilters 断言"下载全部"走服务端枚举：
+// 默认类型集不含贴纸，因而每个类型各有一条专用过滤器管线，既不回退无过滤全量翻页，
+// 也不调用 GetChatHistory。这是 v3.2 修正的核心行为——此前默认集含贴纸，使最常见的
+// "不指定类型"任务整体退化为遍历整条历史。
+func TestScanHistoryPages_DownloadAllUsesServerFilters(t *testing.T) {
 	c := newTestClient(t)
 	fake := &fakeSearchAPI{
 		byFilter: map[string][]*tdclient.Message{
-			tdclient.ConstructorSearchMessagesFilterEmpty: {
+			tdclient.ConstructorSearchMessagesFilterVideo: {
 				{
 					Id: 30, Date: 1700000000,
 					Content: &tdclient.MessageVideo{Video: &tdclient.Video{
 						FileName: "v.mp4", MimeType: "video/mp4", Video: &tdclient.File{Id: 3, Size: 30},
 					}},
 				},
-				{
-					Id: 20, Date: 1700000000,
-					Content: &tdclient.MessageSticker{Sticker: &tdclient.Sticker{
-						Format: &tdclient.StickerFormatWebp{}, Sticker: &tdclient.File{Id: 2, Size: 20},
-					}},
-				},
-				{Id: 10, Date: 1700000000, Content: &tdclient.MessageText{}},
 			},
 		},
-		pageSize: 2,
+		pageSize: 10,
 	}
 
 	spec := &downloader.HistorySpec{ChatID: 1} // 无 MediaTypes = 下载全部
@@ -244,19 +243,60 @@ func TestScanHistoryPages_DownloadAllUsesOneUnfilteredPipeline(t *testing.T) {
 	if fake.historyHit != 0 {
 		t.Errorf("下载全部不应调用 GetChatHistory，实际调用 %d 次", fake.historyHit)
 	}
-	if len(fake.filters) != 2 { // 三条消息分两页
-		t.Fatalf("搜索页数 = %d，期望 2", len(fake.filters))
+	// 每个默认类型一条管线，各自一页即到底
+	if len(fake.filters) != len(mediapkg.DefaultTypes) {
+		t.Fatalf("搜索页数 = %d，期望每个默认类型各一条管线（%d）",
+			len(fake.filters), len(mediapkg.DefaultTypes))
+	}
+	for _, filter := range fake.filters {
+		if filter == tdclient.ConstructorSearchMessagesFilterEmpty {
+			t.Error("下载全部退化成了无过滤全量翻页，服务端枚举未生效")
+		}
+	}
+	if len(got) != 1 || res.foundMedia != 1 || got[0].MessageID != 30 {
+		t.Fatalf("发现媒体 = %+v，期望仅视频 30", got)
+	}
+}
+
+// TestScanHistoryPages_StickerFallsBackToFullHistory 锁定贴纸的取舍：它没有服务端过滤器，
+// 一旦被显式选中，整个任务只能回退到单条无过滤管线遍历完整历史。默认集把它排除正是为了
+// 让这个代价只落在显式勾选贴纸的任务上。
+func TestScanHistoryPages_StickerFallsBackToFullHistory(t *testing.T) {
+	c := newTestClient(t)
+	fake := &fakeSearchAPI{
+		byFilter: map[string][]*tdclient.Message{
+			tdclient.ConstructorSearchMessagesFilterEmpty: {
+				{
+					Id: 20, Date: 1700000000,
+					Content: &tdclient.MessageSticker{Sticker: &tdclient.Sticker{
+						Format: &tdclient.StickerFormatWebp{}, Sticker: &tdclient.File{Id: 2, Size: 20},
+					}},
+				},
+				{Id: 10, Date: 1700000000, Content: &tdclient.MessageText{}},
+			},
+		},
+		pageSize: 10,
+	}
+
+	spec := &downloader.HistorySpec{
+		ChatID:  1,
+		Filters: downloader.HistoryFilters{MediaTypes: []string{mediapkg.Sticker}},
+	}
+	var got []*downloader.MediaInfo
+	res, err := c.scanHistoryPages(context.Background(), fake, spec, collectDispatch(&got))
+	if err != nil {
+		t.Fatalf("扫描失败: %v", err)
+	}
+	if fake.historyHit != 0 {
+		t.Errorf("不应调用 GetChatHistory，实际调用 %d 次", fake.historyHit)
 	}
 	for _, filter := range fake.filters {
 		if filter != tdclient.ConstructorSearchMessagesFilterEmpty {
-			t.Errorf("下载全部使用了 %s，期望无过滤搜索", filter)
+			t.Errorf("选中贴纸时使用了 %s，期望回退为无过滤搜索", filter)
 		}
 	}
-	if len(got) != 2 || res.foundMedia != 2 || res.scannedMessages != 3 {
-		t.Fatalf("发现媒体/扫描消息 = %d/%d/%d，期望 2/2/3", len(got), res.foundMedia, res.scannedMessages)
-	}
-	if got[0].MessageID != 30 || got[1].MessageID != 20 {
-		t.Errorf("分发消息 = [%d %d]，期望视频 30、贴纸 20 各一次", got[0].MessageID, got[1].MessageID)
+	if len(got) != 1 || got[0].MessageID != 20 || res.scannedMessages != 2 {
+		t.Fatalf("发现媒体/扫描消息 = %+v/%d，期望贴纸 20、扫描 2 条", got, res.scannedMessages)
 	}
 }
 
@@ -342,7 +382,7 @@ func TestSearchFiltersFor(t *testing.T) {
 	}{
 		{"单一 video", []string{mediapkg.Video}, 1},
 		{"photo+video", []string{mediapkg.Photo, mediapkg.Video}, 2},
-		{"默认类型集含贴纸，需完整历史", mediapkg.DefaultTypes, 0},
+		{"默认类型集全部可服务端枚举", mediapkg.DefaultTypes, len(mediapkg.DefaultTypes)},
 		{"含贴纸（无服务端过滤器）", []string{mediapkg.Photo, mediapkg.Sticker}, 0},
 		{"空类型列表", nil, 0},
 	}
@@ -359,7 +399,7 @@ func TestSearchFiltersFor(t *testing.T) {
 	}
 }
 
-// TestEffectiveTypes 断言"未指定类型"展开为真正的全部类型集（包括贴纸）。
+// TestEffectiveTypes 断言"未指定类型"展开为默认类型集（不含贴纸）。
 func TestEffectiveTypes(t *testing.T) {
 	if got := effectiveTypes(nil); len(got) != len(mediapkg.DefaultTypes) {
 		t.Errorf("未指定类型时展开为 %v，期望默认类型集 %v", got, mediapkg.DefaultTypes)

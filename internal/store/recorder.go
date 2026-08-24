@@ -37,6 +37,7 @@ func NewRecorder(s *Store, errorHandlers ...func(error)) func(context.Context, *
 		}
 
 		// 每个媒体恰好写两次：入队时插入 queued 行，终态时更新为 completed/failed/skipped。
+		// 缩略图路径并进终态那条 UPDATE——它与终态同时可知，单独再写一次等于白付一次事务提交。
 		switch evt.Status {
 		case downloader.RecordQueued:
 			recordError(s.UpsertHistoryStart(ctx, &HistoryRecord{
@@ -55,10 +56,8 @@ func NewRecorder(s *Store, errorHandlers ...func(error)) func(context.Context, *
 				Minithumb: evt.Media.Minithumb,
 			}))
 		case downloader.RecordCompleted:
-			recordError(s.UpdateHistoryResult(ctx, evt.Media.ChatID, evt.Media.MessageID, HistoryStatusCompleted, "", evt.FilePath))
-			if evt.ThumbPath != "" {
-				recordError(s.SetHistoryThumb(ctx, evt.Media.ChatID, evt.Media.MessageID, evt.ThumbPath))
-			}
+			recordError(s.UpdateHistoryResultWithThumb(ctx, evt.Media.ChatID, evt.Media.MessageID,
+				HistoryStatusCompleted, "", evt.FilePath, evt.ThumbPath))
 		case downloader.RecordFailed:
 			recordError(s.UpdateHistoryResult(ctx, evt.Media.ChatID, evt.Media.MessageID, HistoryStatusFailed, evt.Reason, evt.FilePath))
 		case downloader.RecordSkipped:

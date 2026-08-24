@@ -28,6 +28,12 @@ export const stateStore = new Store<StateSnapshot | null>(null)
 export const tasksStore = new Store<Task[]>([])
 export const chatsStore = new Store<Chat[]>([])
 export const logsStore = new Store<LogEntry[]>([])
+/**
+ * historyFocusStore 是任务卡片下钻到历史页的传递通道：任务卡片写入 task_id，
+ * 历史页读取后按它预置筛选。两个组件不相邻，走 store 比逐层传 props 简单。
+ */
+export const historyFocusStore = new Store<string>('')
+
 export const toastStore = new Store<string>('')
 
 const MAX_LOG_ENTRIES = 400

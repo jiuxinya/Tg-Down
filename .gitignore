@@ -51,3 +51,6 @@ internal/web/static/dist/*
 # 桌面客户端打包产物
 dist/
 tg-down-desktop
+# 裸跑 go build ./cmd/desktop 会在根目录产出名为 desktop 的二进制。
+# 必须锚定为 /desktop：不加斜杠会连 cmd/desktop 与 internal/desktop 目录一起忽略。
+/desktop

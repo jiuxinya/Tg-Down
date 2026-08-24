@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Linux 实现：XDG 自启目录下的 .desktop 文件（GNOME/KDE/多数桌面环境通用）
@@ -26,6 +25,8 @@ func (linuxAutostart) entryPath() (string, error) {
 	return filepath.Join(cfg, "autostart", linuxEntryName), nil
 }
 
+// Enabled 要求条目未被标记 Hidden，且 Exec 仍指向当前可执行文件：
+// 应用被移动或原地更新后旧条目还在，只看存在性会报告"已启用"而实际登录时拉不起来。
 func (linuxAutostart) Enabled() (bool, error) {
 	p, err := (linuxAutostart{}).entryPath()
 	if err != nil {
@@ -36,17 +37,21 @@ func (linuxAutostart) Enabled() (bool, error) {
 		return false, nil
 	}
 	if err != nil {
+		return false, fmt.Errorf("读取自启条目失败: %w", err)
+	}
+	content := string(data)
+	if !desktopEntryEnabled(content) {
+		return false, nil
+	}
+	exe, err := currentExecutable()
+	if err != nil {
 		return false, err
 	}
-	return !strings.Contains(string(data), "Hidden=true"), nil
+	return hasLine(content, desktopEntryExecLine(exe)), nil
 }
 
 func (linuxAutostart) Enable() error {
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("定位可执行文件失败: %w", err)
-	}
-	exe, err = filepath.EvalSymlinks(exe)
+	exe, err := currentExecutable()
 	if err != nil {
 		return err
 	}
@@ -57,25 +62,22 @@ func (linuxAutostart) Enable() error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 		return fmt.Errorf("创建 autostart 目录失败: %w", err)
 	}
-	content := `[Desktop Entry]
-Type=Application
-Name=Tg-Down
-Exec=` + exe + `
-Terminal=false
-X-GNOME-Autostart-enabled=true
-Categories=Network;
-`
-	return os.WriteFile(p, []byte(content), 0o600)
+	return os.WriteFile(p, []byte(desktopEntryContent(exe, false)), 0o600)
 }
 
+// Disable 改写条目为 Hidden=true 而不是删除文件：Enabled 判定的就是这个标记，
+// 桌面环境自身的自启开关也是这么标记的，两边保持同一套语义。
 func (linuxAutostart) Disable() error {
 	p, err := (linuxAutostart{}).entryPath()
 	if err != nil {
 		return err
 	}
-	err = os.Remove(p)
-	if os.IsNotExist(err) {
-		return nil
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		return nil // 本来就没有条目，无需写一个"已禁用"的出来
 	}
-	return err
+	exe, err := currentExecutable()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, []byte(desktopEntryContent(exe, true)), 0o600)
 }

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
+import { ChatSelect } from './ChatSelect'
 import { api, fileURL, thumbURL } from '../api'
 import { ALL_TYPES, MEDIA_TYPE_LABEL, fmtDate, fmtSize } from '../format'
-import { chatsStore, toast, useStore } from '../store'
+import { toast } from '../store'
 import type { HistoryRecord } from '../types'
 
 const PAGE_SIZE = 60
@@ -10,11 +11,21 @@ const PAGE_SIZE = 60
 const VIEWABLE = new Set(['photo', 'video', 'animation', 'video_note', 'sticker'])
 const VIDEO_KINDS = new Set(['video', 'animation', 'video_note'])
 
+// 贴纸有三种载体：webp 是图片，webm 是视频，tgs 是 Lottie 压缩包。
+// 一律按图片渲染会让后两种在灯箱里裂图——服务端也不会内联它们
+// （不在 inlineMediaTypes 中，强制 attachment + octet-stream）。
+function stickerKind(rec: HistoryRecord): 'image' | 'video' | 'unsupported' {
+  const name = rec.file_name.toLowerCase()
+  const mime = (rec.mime_type || '').toLowerCase()
+  if (name.endsWith('.webm') || mime.includes('webm')) return 'video'
+  if (name.endsWith('.tgs') || mime.includes('tgsticker')) return 'unsupported'
+  if (name.endsWith('.webp') || mime.includes('webp')) return 'image'
+  return 'image'
+}
+
 export function Gallery() {
-  const chats = useStore(chatsStore)
   const [items, setItems] = useState<HistoryRecord[]>([])
-  const [page, setPage] = useState(1)
-  const [total, setTotal] = useState(0)
+  const [nextCursor, setNextCursor] = useState('')
   const [chatID, setChatID] = useState(0)
   const [mediaType, setMediaType] = useState('')
   const [groupAlbums, setGroupAlbums] = useState(true)
@@ -24,30 +35,28 @@ export function Gallery() {
   const requestGeneration = useRef(0)
   const loadingRef = useRef(false)
 
-  const params = useCallback((p: number) => {
+  const params = useCallback((cursor: string) => {
     const q = new URLSearchParams()
-    q.set('page', String(p))
-    q.set('page_size', String(PAGE_SIZE))
+    q.set('limit', String(PAGE_SIZE))
     q.set('status', 'completed') // 画廊只展示真正下载下来的文件
+    if (cursor) q.set('cursor', cursor)
     if (chatID) q.set('chat_id', String(chatID))
     if (mediaType) q.set('type', mediaType)
     return q
   }, [chatID, mediaType])
 
-  // 筛选条件变化 → 从第一页重来
+  // 筛选条件变化 → 从头重来
   useEffect(() => {
     const generation = ++requestGeneration.current
     loadingRef.current = true
     setLoading(true)
     setItems([])
-    setTotal(0)
-    setPage(1)
-    api.history(params(1))
+    setNextCursor('')
+    api.history(params(''))
       .then((r) => {
         if (generation !== requestGeneration.current) return
         setItems(r.items || [])
-        setTotal(r.total)
-        setPage(1)
+        setNextCursor(r.next_cursor || '')
       })
       .catch((e) => {
         if (generation === requestGeneration.current) toast((e as Error).message)
@@ -63,18 +72,17 @@ export function Gallery() {
     }
   }, [params])
 
+  // 是否还有下一页由游标本身回答，不再需要"已加载数 >= 总数"这种要先拿总数的判断
   const loadMore = useCallback(async () => {
-    if (loadingRef.current || items.length >= total) return
+    if (loadingRef.current || !nextCursor) return
     const generation = requestGeneration.current
-    const nextPage = page + 1
     loadingRef.current = true
     setLoading(true)
     try {
-      const r = await api.history(params(nextPage))
+      const r = await api.history(params(nextCursor))
       if (generation !== requestGeneration.current) return
       setItems((prev) => appendUniqueHistory(prev, r.items || []))
-      setPage(nextPage)
-      setTotal(r.total)
+      setNextCursor(r.next_cursor || '')
     } catch (e) {
       if (generation === requestGeneration.current) toast((e as Error).message)
     } finally {
@@ -83,7 +91,7 @@ export function Gallery() {
         setLoading(false)
       }
     }
-  }, [items.length, total, page, params])
+  }, [nextCursor, params])
 
   // 滚到底自动加载下一页：十万级历史不可能一次性塞进 DOM
   useEffect(() => {
@@ -97,15 +105,19 @@ export function Gallery() {
   }, [loadMore])
 
   const groups = useMemo(() => groupByAlbum(items, groupAlbums), [items, groupAlbums])
+  // id -> 下标：此前每次点开灯箱都要 items.indexOf(rec) 线性找一遍，
+  // 而画廊滚动加载后 items 会长到数千条
+  const indexByID = useMemo(() => {
+    const m = new Map<number, number>()
+    items.forEach((rec, i) => m.set(rec.id, i))
+    return m
+  }, [items])
 
   return (
     <>
       <div class="card">
         <div class="row">
-          <select value={String(chatID)} onChange={(e) => setChatID(parseInt(e.currentTarget.value, 10))}>
-            <option value="0">全部聊天</option>
-            {chats.map((c) => <option key={c.id} value={String(c.id)}>{c.title}</option>)}
-          </select>
+          <ChatSelect value={chatID} onChange={setChatID} placeholder="全部聊天" />
           <select value={mediaType} onChange={(e) => setMediaType(e.currentTarget.value)}>
             <option value="">全部类型</option>
             {ALL_TYPES.map((t) => <option key={t} value={t}>{MEDIA_TYPE_LABEL[t]}</option>)}
@@ -118,7 +130,7 @@ export function Gallery() {
             按相册分组
           </label>
           <span class="grow" />
-          <span class="meta mono">已加载 {items.length} / {total}</span>
+          <span class="meta mono">已加载 {items.length}{nextCursor ? '+' : ''}</span>
         </div>
       </div>
 
@@ -131,7 +143,7 @@ export function Gallery() {
           {g.albumID > 0 && <h3>相册 #{g.albumID} · {g.items.length} 项</h3>}
           <div class="grid">
             {g.items.map((rec) => (
-              <Cell key={rec.id} rec={rec} onOpen={() => setLightbox(items.indexOf(rec))} />
+              <Cell key={rec.id} rec={rec} onOpen={() => setLightbox(indexByID.get(rec.id) ?? -1)} />
             ))}
           </div>
         </div>
@@ -255,6 +267,20 @@ function Lightbox({
 }
 
 function Viewer({ rec, url }: { rec: HistoryRecord; url: string }) {
+  if (rec.media_type === 'sticker') {
+    const kind = stickerKind(rec)
+    if (kind === 'video') return <video src={url} controls autoPlay loop preload="none" />
+    if (kind === 'image') return <img src={url} alt={rec.file_name} />
+    return (
+      <div class="fallback">
+        <p>{rec.file_name}</p>
+        <p class="meta" style="color:#bbb">
+          {fmtSize(rec.file_size)} · 动画贴纸（.tgs）需在 Telegram 客户端中查看
+        </p>
+        <a href={url} download={rec.file_name}>下载文件</a>
+      </div>
+    )
+  }
   if (VIDEO_KINDS.has(rec.media_type)) {
     // preload=none：灯箱里切换时不要预拉几百 MB 的视频
     return <video src={url} controls autoPlay preload="none" />

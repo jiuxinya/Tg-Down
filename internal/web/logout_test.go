@@ -98,7 +98,7 @@ func TestHandleAuthLogoutWaitsForCanceledDownloads(t *testing.T) {
 	res := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
-		s.handleAuthLogout(res, httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil))
+		s.handleAuthLogout(res, httptest.NewRequest(http.MethodPost, "/api/auth/logout", http.NoBody))
 		close(done)
 	}()
 
@@ -113,7 +113,7 @@ func TestHandleAuthLogoutWaitsForCanceledDownloads(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	secondRes := httptest.NewRecorder()
-	s.handleAuthLogout(secondRes, httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil))
+	s.handleAuthLogout(secondRes, httptest.NewRequest(http.MethodPost, "/api/auth/logout", http.NoBody))
 	if secondRes.Code != http.StatusConflict {
 		t.Fatalf("concurrent logout status = %d, want 409", secondRes.Code)
 	}

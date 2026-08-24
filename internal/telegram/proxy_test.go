@@ -275,13 +275,13 @@ func TestRunConnectHint(t *testing.T) {
 		c := newTestClient(t)
 		// newTestClient 默认 error 级别会过滤 Warn，这里换成 debug 以捕获提示
 		c.logger = logger.New("debug")
-		cap := newLogCapture()
-		c.logger.SetHook(cap.record)
-		return c, cap
+		capture := newLogCapture()
+		c.logger.SetHook(capture.record)
+		return c, capture
 	}
 
 	t.Run("无代理停滞时建议配置代理", func(t *testing.T) {
-		c, cap := newLoggedClient(t)
+		c, capture := newLoggedClient(t)
 		c.connState.Store(ConnectionConnecting)
 		done := make(chan struct{})
 		finished := make(chan struct{})
@@ -292,7 +292,7 @@ func TestRunConnectHint(t *testing.T) {
 		time.Sleep(120 * time.Millisecond)
 		close(done)
 		<-finished // 与 goroutine 同步退出，避免与后续用例竞争
-		msgs := cap.messages()
+		msgs := capture.messages()
 		if len(msgs) == 0 {
 			t.Fatal("连接停滞时应输出诊断提示")
 		}
@@ -306,7 +306,7 @@ func TestRunConnectHint(t *testing.T) {
 	})
 
 	t.Run("已配代理停滞时提示检查代理本身", func(t *testing.T) {
-		c, cap := newLoggedClient(t)
+		c, capture := newLoggedClient(t)
 		c.connState.Store(ConnectionWaitingNetwork)
 		done := make(chan struct{})
 		finished := make(chan struct{})
@@ -317,7 +317,7 @@ func TestRunConnectHint(t *testing.T) {
 		time.Sleep(60 * time.Millisecond)
 		close(done)
 		<-finished
-		msgs := cap.messages()
+		msgs := capture.messages()
 		if len(msgs) == 0 {
 			t.Fatal("连接停滞时应输出诊断提示")
 		}
@@ -327,7 +327,7 @@ func TestRunConnectHint(t *testing.T) {
 	})
 
 	t.Run("就绪后不再提示", func(t *testing.T) {
-		c, cap := newLoggedClient(t)
+		c, capture := newLoggedClient(t)
 		c.connState.Store(ConnectionReady)
 		done := make(chan struct{})
 		finished := make(chan struct{})
@@ -341,13 +341,13 @@ func TestRunConnectHint(t *testing.T) {
 			close(done)
 			t.Fatal("Ready 状态下 runConnectHint 应立即退出")
 		}
-		if msgs := cap.messages(); len(msgs) != 0 {
+		if msgs := capture.messages(); len(msgs) != 0 {
 			t.Fatalf("就绪后不应输出提示: %q", msgs)
 		}
 	})
 
 	t.Run("Connect 返回后停止输出", func(t *testing.T) {
-		c, cap := newLoggedClient(t)
+		c, capture := newLoggedClient(t)
 		c.connState.Store(ConnectionConnecting)
 		done := make(chan struct{})
 		finished := make(chan struct{})
@@ -358,13 +358,13 @@ func TestRunConnectHint(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		close(done) // Connect 返回时关闭 done
 		<-finished
-		count := len(cap.messages())
+		count := len(capture.messages())
 		if count == 0 {
 			t.Fatal("关闭前应有至少一条提示")
 		}
 		// goroutine 已确认退出，之后不应再有新输出
 		time.Sleep(2 * hintDelay)
-		if after := len(cap.messages()); after != count {
+		if after := len(capture.messages()); after != count {
 			t.Fatalf("done 关闭后仍在继续输出: %d -> %d", count, after)
 		}
 	})
@@ -378,7 +378,7 @@ type logCapture struct {
 
 func newLogCapture() *logCapture { return &logCapture{} }
 
-func (c *logCapture) record(level, msg string) {
+func (c *logCapture) record(_, msg string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.msg = append(c.msg, msg)

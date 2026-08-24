@@ -823,6 +823,28 @@ func (c *Client) SetSaveMetadata(v bool) error {
 	return c.SaveConfig()
 }
 
+// PathTemplate 返回当前的落盘路径模板
+func (c *Client) PathTemplate() string { return c.downloader.PathTemplate() }
+
+// SetPathTemplate 更新落盘路径模板（对后续下载生效），并写回 config.yaml。
+//
+// 必须先校验：downloader.SetPathTemplate 对非法模板会静默回退到默认值，
+// 不拦住就会表现为"用户改了个错模板、界面没有任何提示、布局悄悄变回默认"。
+func (c *Client) SetPathTemplate(tpl string) error {
+	tpl = strings.TrimSpace(tpl)
+	if tpl == "" {
+		tpl = downloader.DefaultPathTemplate
+	}
+	if problem := downloader.ValidatePathTemplate(tpl); problem != "" {
+		return errors.New(problem)
+	}
+	c.downloader.SetPathTemplate(tpl)
+	c.credMu.Lock()
+	c.config.Download.PathTemplate = tpl
+	c.credMu.Unlock()
+	return c.SaveConfig()
+}
+
 // SetScanProgressFunc 设置历史扫描进度回调；须在 Connect/任务运行前注册
 func (c *Client) SetScanProgressFunc(fn func(taskID string, scannedMessages, foundMedia, scanCursor int64)) {
 	c.scanProgressFunc = fn
@@ -1695,12 +1717,34 @@ func (c *Client) resolvePublicChat(ctx context.Context, td tdAPI, username strin
 	return ResolvedTarget{ChatID: chat.Id, Title: chat.Title}, nil
 }
 
+// countMediaByFilter 统计单个过滤器的消息数，经 retrier 调用。
+//
+// GetChatMessageCount 会被服务端限频，裸调时一次 429 就使该类型的计数永久缺失——
+// 这是 client.go 里最后一个绕过 retrier 的 TDLib 调用点。
+func (c *Client) countMediaByFilter(ctx context.Context, td tdAPI, chatID int64, f tdclient.SearchMessagesFilter) (*tdclient.Count, error) {
+	var cnt *tdclient.Count
+	err := c.retrier.Do(ctx, func() error {
+		var err error
+		cnt, err = tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Count, error) {
+			return td.GetChatMessageCount(cc, &tdclient.GetChatMessageCountRequest{
+				ChatId:      chatID,
+				Filter:      f,
+				ReturnLocal: false,
+			})
+		})
+		return err
+	})
+	return cnt, err
+}
+
 // CountHistoryMedia 统计聊天历史中可下载媒体的总数（服务端近似值）。
 // mediaTypes 非空时只统计选中的类型；日期/大小过滤无法在服务端预估，结果为上估。
-// 单个过滤器失败仅跳过；全部失败返回错误，调用方回退为未知总数。
 //
-// 选中的类型里只要有一个无服务端计数能力（贴纸），总数就返回 0（= 未知）：
-// 拿其余类型的和当分母，分子却含贴纸，进度条会冲破 100%。宁可没有分母，也不要错的分母。
+// 总数要么完整，要么按未知（0）处理，不存在中间态。两条分支服务于同一条原则——
+// 宁可没有分母，也不要错的分母：
+//   - 选中的类型里只要有一个无服务端计数能力（贴纸），直接返回未知；
+//   - 任一过滤器经重试仍失败，同样返回未知。此前的做法是跳过失败项、把其余类型的
+//     和当作完整总数返回，于是一次 FLOOD_WAIT 就会产出偏小的分母，进度条冲破 100%。
 func (c *Client) CountHistoryMedia(ctx context.Context, chatID int64, mediaTypes []string) (int64, error) {
 	td := c.client()
 	if td == nil {
@@ -1724,31 +1768,23 @@ func (c *Client) CountHistoryMedia(ctx context.Context, chatID int64, mediaTypes
 		}
 	}
 	var total int64
-	succeeded := 0
 	for _, filter := range selected {
 		f := filter
-		cnt, err := tdCall(ctx, metadataTimeout, func(cc context.Context) (*tdclient.Count, error) {
-			return td.GetChatMessageCount(cc, &tdclient.GetChatMessageCountRequest{
-				ChatId:      chatID,
-				Filter:      f,
-				ReturnLocal: false,
-			})
-		})
+		cnt, err := c.countMediaByFilter(ctx, td, chatID, f)
 		if err != nil {
 			if ctx.Err() != nil {
 				return 0, ctx.Err()
 			}
-			c.logger.Warn("统计媒体数量失败 (%s): %v", f.SearchMessagesFilterConstructor(), err)
-			continue
+			c.logger.Warn("统计媒体数量失败 (%s)，本任务总数按未知处理: %v",
+				f.SearchMessagesFilterConstructor(), err)
+			return 0, nil
 		}
-		if cnt.Count < 0 { // -1 = 未知
-			continue
+		if cnt.Count < 0 { // -1 = 服务端也不知道
+			c.logger.Info("服务端未返回 %s 的数量，本任务总数按未知处理",
+				f.SearchMessagesFilterConstructor())
+			return 0, nil
 		}
 		total += int64(cnt.Count)
-		succeeded++
-	}
-	if succeeded == 0 {
-		return 0, fmt.Errorf("无法统计聊天 %d 的媒体总数", chatID)
 	}
 	return total, nil
 }
