@@ -823,6 +823,28 @@ func (c *Client) SetSaveMetadata(v bool) error {
 	return c.SaveConfig()
 }
 
+// PathTemplate 返回当前的落盘路径模板
+func (c *Client) PathTemplate() string { return c.downloader.PathTemplate() }
+
+// SetPathTemplate 更新落盘路径模板（对后续下载生效），并写回 config.yaml。
+//
+// 必须先校验：downloader.SetPathTemplate 对非法模板会静默回退到默认值，
+// 不拦住就会表现为"用户改了个错模板、界面没有任何提示、布局悄悄变回默认"。
+func (c *Client) SetPathTemplate(tpl string) error {
+	tpl = strings.TrimSpace(tpl)
+	if tpl == "" {
+		tpl = downloader.DefaultPathTemplate
+	}
+	if problem := downloader.ValidatePathTemplate(tpl); problem != "" {
+		return errors.New(problem)
+	}
+	c.downloader.SetPathTemplate(tpl)
+	c.credMu.Lock()
+	c.config.Download.PathTemplate = tpl
+	c.credMu.Unlock()
+	return c.SaveConfig()
+}
+
 // SetScanProgressFunc 设置历史扫描进度回调；须在 Connect/任务运行前注册
 func (c *Client) SetScanProgressFunc(fn func(taskID string, scannedMessages, foundMedia, scanCursor int64)) {
 	c.scanProgressFunc = fn

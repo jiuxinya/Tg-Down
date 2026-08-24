@@ -212,8 +212,8 @@ func (t *task) toDTOLocked() TaskDTO {
 	}
 	speedBps, etaSeconds := t.speedAndETALocked(time.Now())
 	return TaskDTO{
-		SpeedBps:   speedBps,
-		ETASeconds: etaSeconds,
+		SpeedBps:        speedBps,
+		ETASeconds:      etaSeconds,
 		Filters:         filters,
 		MessageID:       t.messageID,
 		ID:              t.id,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"tg-down/internal/config"
 	"tg-down/internal/logger"
 	"tg-down/internal/queue"
 	"tg-down/internal/store"
@@ -466,5 +468,56 @@ func TestHistoryCursorPaginationWalksAllRows(t *testing.T) {
 	}
 	if len(seen) != rows {
 		t.Errorf("游标遍历得到 %d 行，期望 %d", len(seen), rows)
+	}
+}
+
+// pathTemplateClient 记录路径模板的设置调用，校验非法模板不会落到 downloader。
+type pathTemplateClient struct {
+	tgapi.Client
+	tpl string
+}
+
+func (c *pathTemplateClient) PathTemplate() string { return c.tpl }
+
+// settingsSnapshot 会读下面这些运行态，桩件补齐即可，取值本身与本用例无关
+func (c *pathTemplateClient) DownloadPath() string     { return "/tmp" }
+func (c *pathTemplateClient) ClassifyByType() bool     { return false }
+func (c *pathTemplateClient) SaveMetadata() bool       { return false }
+func (c *pathTemplateClient) DownloadConcurrency() int { return 1 }
+func (c *pathTemplateClient) ActiveDownloadCount() int { return 0 }
+
+func (c *pathTemplateClient) SetPathTemplate(tpl string) error {
+	if !strings.Contains(tpl, "{chat_id}") {
+		return errors.New("模板必须包含 {chat_id}")
+	}
+	c.tpl = tpl
+	return nil
+}
+
+// TestSettingsPathTemplateRejectsInvalid 锁定路径模板的校验语义：
+// downloader.SetPathTemplate 对非法模板会静默回退默认布局，接口层必须拦成 400，
+// 否则表现为"用户改了个错模板、界面无提示、布局悄悄变回默认"。
+func TestSettingsPathTemplateRejectsInvalid(t *testing.T) {
+	client := &pathTemplateClient{tpl: "chat_{chat_id}/{name}"}
+	s := &Server{client: client, logger: logger.New("error"), cfg: &config.Config{}}
+
+	res := httptest.NewRecorder()
+	body := `{"path_template":"没有占位符"}`
+	s.handleSettingsUpdate(res, httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(body)))
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d，期望 400 (%s)", res.Code, res.Body.String())
+	}
+	if client.tpl != "chat_{chat_id}/{name}" {
+		t.Errorf("非法模板被写入: %q", client.tpl)
+	}
+
+	res = httptest.NewRecorder()
+	body = `{"path_template":"{chat_id}/{date}/{name}"}`
+	s.handleSettingsUpdate(res, httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(body)))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d，期望 200 (%s)", res.Code, res.Body.String())
+	}
+	if client.tpl != "{chat_id}/{date}/{name}" {
+		t.Errorf("合法模板未写入: %q", client.tpl)
 	}
 }

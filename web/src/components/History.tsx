@@ -4,7 +4,7 @@ import { ChatSelect } from './ChatSelect'
 import {
   ALL_TYPES, HISTORY_STATUS_LABEL, MEDIA_TYPE_LABEL, fmtSize, fmtTime,
 } from '../format'
-import { toast } from '../store'
+import { historyFocusStore, toast, useStore } from '../store'
 import type { HistoryRecord, MediaTypeStat } from '../types'
 
 const PAGE_SIZES = [20, 50, 100]
@@ -17,6 +17,8 @@ const SORT_LABEL: Record<string, string> = {
 }
 
 export function History() {
+  // taskID 由任务卡片的"查看文件"写入；清空即回到全部记录
+  const focusTaskID = useStore(historyFocusStore)
   const [items, setItems] = useState<HistoryRecord[]>([])
   const [stats, setStats] = useState<MediaTypeStat[]>([])
   const [total, setTotal] = useState<number | null>(null)
@@ -47,8 +49,9 @@ export function History() {
     if (mediaType) q.set('type', mediaType)
     if (status) q.set('status', status)
     if (debouncedQuery) q.set('q', debouncedQuery)
+    if (focusTaskID) q.set('task_id', focusTaskID)
     return q
-  }, [chatID, mediaType, status, debouncedQuery])
+  }, [chatID, mediaType, status, debouncedQuery, focusTaskID])
 
   const load = useCallback(async (cursor: string, withTotal: boolean) => {
     const generation = ++requestGeneration.current
@@ -122,6 +125,12 @@ export function History() {
   return (
     <>
       <div class="card">
+        {focusTaskID && (
+          <div class="row meta" style="margin-bottom:8px">
+            <span>正在查看任务 <code>{focusTaskID.slice(0, 8)}</code> 下载的文件</span>
+            <button class="sm" onClick={() => historyFocusStore.set('')}>显示全部记录</button>
+          </div>
+        )}
         <div class="row">
           <ChatSelect value={chatID} onChange={setChatID} placeholder="全部聊天" />
           <select value={mediaType} onChange={(e) => setMediaType(e.currentTarget.value)}>

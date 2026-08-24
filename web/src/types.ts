@@ -160,6 +160,7 @@ export interface Settings {
   classify_by_type: boolean
   media_concurrency: DownloadSettings
   save_metadata?: boolean
+  path_template?: string
   proxy?: string
   task_concurrency?: number
   auto_retry?: number
@@ -170,6 +171,7 @@ export interface Settings {
 
 export interface SettingsUpdate {
   classify_by_type?: boolean
+  path_template?: string
   max_concurrent?: number
   save_metadata?: boolean
   proxy?: string | null

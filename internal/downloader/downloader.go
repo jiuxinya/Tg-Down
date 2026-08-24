@@ -1298,6 +1298,9 @@ func (d *Downloader) TargetPath(media *MediaInfo) string {
 // DownloadPath 返回下载根目录
 func (d *Downloader) DownloadPath() string { return d.downloadPath }
 
+// PathTemplate 返回当前生效的路径模板（未配置时为默认布局）
+func (d *Downloader) PathTemplate() string { return d.pathTemplate() }
+
 // pathTemplate 返回当前生效的路径模板（未配置时为默认布局）
 func (d *Downloader) pathTemplate() string {
 	tpl, _ := d.pathTpl.Load().(string)

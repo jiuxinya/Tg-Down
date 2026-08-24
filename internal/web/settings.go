@@ -18,6 +18,7 @@ type settingsDTO struct {
 	ClassifyByType     bool                `json:"classify_by_type"`
 	MediaConcurrency   downloadSettingsDTO `json:"media_concurrency"`
 	SaveMetadata       bool                `json:"save_metadata"`
+	PathTemplate       string              `json:"path_template"`
 	Proxy              string              `json:"proxy"`
 	TaskConcurrency    int                 `json:"task_concurrency"`
 	AutoRetry          int                 `json:"auto_retry"`
@@ -32,6 +33,7 @@ type updateSettingsRequest struct {
 	ClassifyByType     *bool   `json:"classify_by_type"`
 	MaxConcurrent      *int    `json:"max_concurrent"`
 	SaveMetadata       *bool   `json:"save_metadata"`
+	PathTemplate       *string `json:"path_template"`
 	Proxy              *string `json:"proxy"`
 	TaskConcurrency    *int    `json:"task_concurrency"`
 	AutoRetry          *int    `json:"auto_retry"`
@@ -72,6 +74,7 @@ func (s *Server) settingsSnapshot() settingsDTO {
 		ClassifyByType:     s.client.ClassifyByType(),
 		MediaConcurrency:   downloadSettingsDTO{MaxConcurrent: s.client.DownloadConcurrency(), Active: s.client.ActiveDownloadCount()},
 		SaveMetadata:       s.client.SaveMetadata(),
+		PathTemplate:       s.client.PathTemplate(),
 		Proxy:              config.MaskProxyURL(s.cfg.Telegram.Proxy),
 		TaskConcurrency:    s.cfg.Queue.MaxConcurrentTasks,
 		AutoRetry:          s.cfg.Queue.AutoRetryCount(),
@@ -104,6 +107,15 @@ func (s *Server) applyHotSettings(w http.ResponseWriter, body *updateSettingsReq
 		}
 		s.logger.Info("元数据 sidecar 已%s", onOff(*body.SaveMetadata))
 		notices = append(notices, "元数据设置对后续下载生效")
+	}
+	if body.PathTemplate != nil {
+		// 非法模板返回 400 而非静默回退默认布局：后者会让用户以为改动生效了
+		if err := s.client.SetPathTemplate(*body.PathTemplate); err != nil {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return nil, false
+		}
+		s.logger.Info("落盘路径模板已更新: %s", s.client.PathTemplate())
+		notices = append(notices, "路径模板对后续下载生效，已下载的文件不会移动")
 	}
 	return notices, true
 }

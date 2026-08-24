@@ -12,7 +12,7 @@ import { CONNECTION_LABEL, fmtSize } from './format'
 import { LOCAL_INSTANCE, desktopApi, probeDesktop, selectedInstance } from './desktop'
 import type { DesktopInfo } from './types'
 import {
-  connectEvents, loadChats, loadTasks, stateStore, toast, toastStore, useStore,
+  connectEvents, historyFocusStore, loadChats, loadTasks, stateStore, toast, toastStore, useStore,
 } from './store'
 import type { Settings } from './types'
 
@@ -33,6 +33,9 @@ export function App() {
   const snap = useStore(stateStore)
   const msg = useStore(toastStore)
   const [tab, setTab] = useState<Tab>('tasks')
+  // 任务卡片点"查看文件"时写入 task_id，这里据此切到历史页
+  const historyFocus = useStore(historyFocusStore)
+  useEffect(() => { if (historyFocus) setTab('history') }, [historyFocus])
   const [settings, setSettings] = useState<Settings | null>(null)
   const [accessDenied, setAccessDenied] = useState(false)
   const [eventNotice, setEventNotice] = useState('')

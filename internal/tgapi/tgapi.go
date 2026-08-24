@@ -92,6 +92,8 @@ type Client interface {
 	SetClassifyByType(on bool) error
 	SaveMetadata() bool
 	SetSaveMetadata(v bool) error
+	PathTemplate() string
+	SetPathTemplate(tpl string) error
 	DownloadConcurrency() int
 	SetDownloadConcurrency(n int) error
 	ActiveDownloadCount() int

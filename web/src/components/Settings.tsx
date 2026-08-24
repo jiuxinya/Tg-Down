@@ -19,6 +19,7 @@ export function SettingsPanel({
   const [proxy, setProxy] = useState('')
   const [webhook, setWebhook] = useState('')
   const [logLevel, setLogLevel] = useState('info')
+  const [pathTemplate, setPathTemplate] = useState('')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -29,6 +30,7 @@ export function SettingsPanel({
     setProxy(settings.proxy ?? '')
     setWebhook(settings.notify_webhook_url ?? '')
     setLogLevel(settings.log_level ?? 'info')
+    setPathTemplate(settings.path_template ?? '')
   }, [settings])
 
   // apply 提交部分更新并回写快照；后端附带的提示（重启生效等）逐条弹出
@@ -47,6 +49,10 @@ export function SettingsPanel({
     } finally {
       setBusy(false)
     }
+  }
+
+  const savePathTemplate = () => {
+    if (settings) void apply({ path_template: pathTemplate.trim() }, '路径模板已保存')
   }
 
   const toggleClassify = () => {
@@ -119,6 +125,24 @@ export function SettingsPanel({
           <input type="checkbox" checked={!!settings.save_metadata} disabled={busy} onChange={toggleMetadata} />
           {settings.save_metadata ? '已开启' : '已关闭'}
         </label>
+      </div>
+      <div class="setting-row">
+        <div>
+          <strong>落盘路径模板</strong>
+          <div class="meta">
+            可用占位符：{'{chat_id}'} {'{chat_title}'} {'{type}'} {'{album}'} {'{date}'}
+            {' '}{'{sender}'} {'{msg_id}'} {'{name}'} {'{ext}'}；留空恢复默认布局。
+            对后续下载生效，已下载的文件不会移动。
+          </div>
+        </div>
+        <div class="row">
+          <input
+            style="width:280px" placeholder="chat_{chat_id}/{type}/{album}/{name}"
+            value={pathTemplate} disabled={busy}
+            onInput={(e) => setPathTemplate(e.currentTarget.value)}
+          />
+          <button class="sm" disabled={busy} onClick={savePathTemplate}>保存</button>
+        </div>
       </div>
       <div class="setting-row">
         <div>
