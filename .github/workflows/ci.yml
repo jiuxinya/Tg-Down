@@ -79,6 +79,9 @@ jobs:
 
       # 标签集必须与上面的 vet 一致：不一致会让 cmd/desktop 编译出两套，
       # 而被测的那套缺 Wails 的 production 标签，等于没测到发布形态
+      - name: Run web tests
+        run: cd web && npm test
+
       - name: Run tests
         run: go test -race -cover -tags "desktop,production,webkit2_41" ./...
 
