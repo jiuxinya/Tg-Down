@@ -442,7 +442,7 @@ jobs:
               覆盖 Debian 11+/Ubuntu 20.04+），OpenSSL 1.1 已随包捆绑于 `lib/`，开箱即用
             - **macOS Apple Silicon**: `tg-down-darwin-arm64.tar.gz`——需 `brew install openssl@3`
             - **Windows x86_64**: `tg-down-windows-amd64.zip`——MinGW-w64 构建，解压即用
-            - **Docker（推荐，含 arm64）**: `docker pull ghcr.io/heartcoolman/tg-down:latest`，
+            - **Docker（推荐，含 arm64）**: `docker pull ghcr.io/jiuxinya/tg-down:latest`，
               飞牛 fnOS 等 NAS 部署见 README「飞牛OS (fnOS) 部署」
 
             ## 🖥 桌面客户端
