@@ -15,8 +15,9 @@ import (
 const (
 	timelineDefaultLimit = 50
 	timelineMaxLimit     = 200
-	// timelineFreshTTL 是时间线索引的缓存有效期；下载新文件后点「刷新」强制重建
-	timelineFreshTTL = 30 * time.Second
+	// timelineFreshTTL 是时间线索引的缓存有效期。过期后不再阻塞请求：
+	// 自动触发后台增量重建，旧索引继续服务（stale-while-revalidate）。
+	timelineFreshTTL = 5 * time.Minute
 )
 
 // handleTimeline 返回频道摘要列表 + 时间线条目（分页）。
@@ -80,17 +81,26 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// timelineEnsureFresh 在缓存过期时重建索引（全表扫描加锁，几十万文件在秒级）
+// timelineEnsureFresh 缓存过期时触发后台重建（单飞），本次请求立即用旧索引响应；
+// 首次（builtAt 为零）同样走后台，避免打开页面被全量扫描阻塞。
 func (s *Server) timelineEnsureFresh() {
 	s.timelineMu.Lock()
-	defer s.timelineMu.Unlock()
-	if time.Since(s.timelineBuiltAt) <= timelineFreshTTL {
+	if time.Since(s.timelineBuiltAt) <= timelineFreshTTL || s.timelineRebuilding {
+		s.timelineMu.Unlock()
 		return
 	}
-	if err := s.timelineIndex.Rebuild(s.downloadRoot); err != nil {
-		s.logger.Warn("时间线索引构建失败: %v", err)
-	}
-	s.timelineBuiltAt = time.Now()
+	s.timelineRebuilding = true
+	s.timelineMu.Unlock()
+
+	go func() {
+		if err := s.timelineIndex.Rebuild(s.downloadRoot); err != nil {
+			s.logger.Warn("时间线索引重建失败: %v", err)
+		}
+		s.timelineMu.Lock()
+		s.timelineBuiltAt = time.Now()
+		s.timelineRebuilding = false
+		s.timelineMu.Unlock()
+	}()
 }
 
 // handleTimelineFile 提供时间线条目对应的媒体文件。

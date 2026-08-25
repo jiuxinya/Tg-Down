@@ -284,6 +284,95 @@ func idsOf(list []Entry) []int64 {
 	return out
 }
 
+func TestIncrementalRebuild(t *testing.T) {
+	root := t.TempDir()
+	future := time.Now().Add(30 * time.Second) // 确保 Chtimes 后目录秒级 mtime 变化
+
+	const captionA = "A-旧文案"
+	writeSidecar(t, root, -1001, 1, time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC), captionA, 0, "photo")
+	writeSidecar(t, root, -1002, 2, time.Date(2026, 8, 25, 11, 0, 0, 0, time.UTC), "B", 0, "photo")
+
+	ix := New()
+	if err := ix.Rebuild(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := idsOf(mustQueryAll(t, ix)); len(got) != 2 {
+		t.Fatalf("全量后条目 = %v, want 2", got)
+	}
+
+	// 无变化：增量重建应保持 2 条
+	if err := ix.Rebuild(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := idsOf(mustQueryAll(t, ix)); len(got) != 2 {
+		t.Fatalf("无变化增量后条目 = %v, want 2", got)
+	}
+
+	// 修改 A 的 caption：重写 sidecar + 触碰目录 mtime
+	dirA := filepath.Join(root, "chat_-1001", "photo")
+	dirA_ := filepath.Join(root, "chat_-1001", "photo")
+	_ = dirA_
+	payloadA := `{"message_id":1,"chat_id":-1001,"chat_title":"频道-1001","date":1785049200,"date_text":"2026-08-25 10:00:00","caption":"A-新文案","album_id":0,"media_type":"photo","file_name":"f_1.jpg","file_size":100,"mime_type":"image/jpeg","unique_id":"u1","message_url":"https://t.me/c/1001/1"}`
+	if err := os.WriteFile(filepath.Join(dirA, "f_1.jpg.json"), []byte(payloadA), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(dirA, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Rebuild(root); err != nil {
+		t.Fatal(err)
+	}
+	items := mustQueryAll(t, ix)
+	if len(items) != 2 {
+		t.Fatalf("修改后条目 = %v, want 2", idsOf(items))
+	}
+	for _, e := range items {
+		if e.MessageID == 1 && e.Caption != "A-新文案" {
+			t.Errorf("A 的 caption = %q, want 新文案（增量未生效）", e.Caption)
+		}
+	}
+
+	// 新增频道 C：增量应看到
+	writeSidecar(t, root, -1003, 3, time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC), "C", 0, "photo")
+	if err := ix.Rebuild(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := idsOf(mustQueryAll(t, ix)); len(got) != 3 {
+		t.Fatalf("新增后条目 = %v, want 3", got)
+	}
+
+	// 删除频道 B 的文件：增量应移除
+	dirB := filepath.Join(root, "chat_-1002", "photo")
+	for _, n := range []string{"f_2.jpg.json", "f_2.jpg"} {
+		if err := os.Remove(filepath.Join(dirB, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(dirB, future.Add(2*time.Second), future.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Rebuild(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := idsOf(mustQueryAll(t, ix)); len(got) != 2 {
+		t.Fatalf("删除后条目 = %v, want 2", got)
+	}
+	for _, e := range mustQueryAll(t, ix) {
+		if e.ChatID == -1002 {
+			t.Errorf("已删频道 -1002 仍留在索引: %+v", e)
+		}
+	}
+}
+
+func mustQueryAll(t *testing.T, ix *Index) []Entry {
+	t.Helper()
+	items, _, err := ix.Query(0, 0, 0, 1000, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return items
+}
+
 func TestTagMulti(t *testing.T) {
 	root := t.TempDir()
 	writeSidecar(t, root, -1001, 1, time.Date(2026, 8, 25, 10, 0, 4, 0, time.UTC), "无标签", 0, "photo")

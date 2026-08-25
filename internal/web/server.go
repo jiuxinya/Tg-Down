@@ -119,9 +119,10 @@ type Server struct {
 	chats    []tgapi.ChatInfo
 
 	// 时间线（sidecar 扫描索引）及其重建互斥锁
-	timelineIndex  *timeline.Index
-	timelineMu     sync.Mutex
-	timelineBuiltAt time.Time
+	timelineIndex      *timeline.Index
+	timelineMu         sync.Mutex
+	timelineBuiltAt    time.Time
+	timelineRebuilding bool // 后台重建进行中（单飞，防重复触发）
 
 	codeCh   chan string
 	passCh   chan string
