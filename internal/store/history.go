@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -94,6 +95,30 @@ FROM history WHERE id = ?`
 	}
 
 	return rec, nil
+}
+
+// DeleteHistoryByTask 删除某个任务关联的全部下载历史记录（只删记录，不动磁盘文件）。
+// 返回删除的行数。
+func (s *Store) DeleteHistoryByTask(ctx context.Context, taskID string) (int64, error) {
+	res, err := s.execContext(ctx, `DELETE FROM history WHERE task_id = ?`, taskID)
+	if err != nil {
+		return 0, fmt.Errorf("删除任务下载历史失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取删除行数失败: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteHistory 删除一条下载历史记录（只删记录，不动磁盘文件）。
+// 画廊/文件访问入口随之失效（按 id 查库），但文件本体保留在下载目录。
+func (s *Store) DeleteHistory(ctx context.Context, id int64) error {
+	res, err := s.execContext(ctx, `DELETE FROM history WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("删除下载历史失败: %w", err)
+	}
+	return checkRowsAffected(res, "下载历史", strconv.FormatInt(id, 10))
 }
 
 // UpdateHistoryResult 按 (chat_id, message_id) 更新下载结果；状态为终态
