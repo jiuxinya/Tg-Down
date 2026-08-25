@@ -1,8 +1,10 @@
 name: Release
+# 发布通道：push v* tag 自动触发；也可在 Actions 页面手动运行（选择要发布的 tag 分支）
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read

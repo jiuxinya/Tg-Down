@@ -10,7 +10,7 @@ on:
 
 env:
   # GHCR 引用必须小写，repository_owner 可能含大写，故写死
-  IMAGE: ghcr.io/heartcoolman/tg-down
+  IMAGE: ghcr.io/jiuxinya/tg-down
 
 permissions:
   contents: read
