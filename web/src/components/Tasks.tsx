@@ -276,6 +276,19 @@ function TaskCard({ task: t }: { task: Task }) {
             查看文件
           </button>
         )}
+        {done > 0 && (
+          <button
+            class="sm danger" title="删除本任务的下载历史记录（磁盘文件保留）"
+            onClick={() => {
+              if (!confirm(`清除本任务的下载历史记录？\n（${done} 条记录将被删除，磁盘文件保留）`)) return
+              api.clearTaskHistory(t.id)
+                .then((r) => { toast(`已清除 ${r.deleted} 条记录`); void loadTasks() })
+                .catch((e) => toast((e as Error).message))
+            }}
+          >
+            清除记录
+          </button>
+        )}
         {(t.status === 'queued' || t.status === 'running') && (
           <button class="sm danger" onClick={() => api.cancelTask(t.id).then(loadTasks).catch((e) => toast(e.message))}>
             取消

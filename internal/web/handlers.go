@@ -41,6 +41,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/resolve", s.handleResolve)
 	mux.HandleFunc("POST /api/tasks/{id}/cancel", s.handleTaskCancel)
 	mux.HandleFunc("POST /api/tasks/{id}/retry", s.handleTaskRetry)
+	mux.HandleFunc("DELETE /api/tasks/{id}/history", s.handleTaskHistoryDelete)
 	mux.HandleFunc("GET /api/download/settings", s.handleDownloadSettings)
 	mux.HandleFunc("POST /api/download/concurrency", s.handleDownloadConcurrency)
 	mux.HandleFunc("POST /api/media/{id}/pause", s.handleMediaPause)
@@ -52,11 +53,14 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/history/export", s.handleHistoryExport)
 	mux.HandleFunc("GET /api/history/{id}/file", s.handleHistoryFile)
 	mux.HandleFunc("GET /api/history/{id}/thumb", s.handleHistoryThumb)
+	mux.HandleFunc("DELETE /api/history/{id}", s.handleHistoryDelete)
 	mux.HandleFunc("POST /api/export", s.handleExport)
 	mux.HandleFunc("GET /api/schedules", s.handleSchedulesList)
 	mux.HandleFunc("POST /api/schedules", s.handleSchedulesCreate)
 	mux.HandleFunc("DELETE /api/schedules/{id}", s.handleScheduleDelete)
 	mux.HandleFunc("POST /api/schedules/{id}/toggle", s.handleScheduleToggle)
+	mux.HandleFunc("GET /api/timeline", s.handleTimeline)
+	mux.HandleFunc("GET /api/timeline/file", s.handleTimelineFile)
 }
 
 // uiNotBuiltMessage 在前端产物缺失时给出的提示（而不是白屏让人一头雾水）
@@ -481,6 +485,31 @@ func (s *Server) handleScheduleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeOK(w)
+}
+
+// handleHistoryDelete 删除一条历史下载记录（只删数据库记录，不影响磁盘文件）
+func (s *Server) handleHistoryDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "无效的记录 ID")
+		return
+	}
+	if err := s.store.DeleteHistory(r.Context(), id); err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.writeOK(w)
+}
+
+// handleTaskHistoryDelete 删除某个任务关联的全部下载历史记录（文件保留）
+func (s *Server) handleTaskHistoryDelete(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	n, err := s.store.DeleteHistoryByTask(r.Context(), taskID)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.writeJSON(w, map[string]any{"deleted": n})
 }
 
 func (s *Server) handleScheduleToggle(w http.ResponseWriter, r *http.Request) {

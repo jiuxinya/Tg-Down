@@ -117,6 +117,19 @@ export function History() {
     }
   }
 
+  const del = async (rec: HistoryRecord) => {
+    if (!confirm(`删除这条下载记录？\n${rec.file_name}\n\n只删记录，磁盘文件保留。`)) return
+    try {
+      await api.deleteHistory(rec.id)
+      toast('已删除记录')
+      // 回到当前页重新加载（保持页码位置）
+      const cur = cursorStack.length > 0 ? cursorStack[cursorStack.length - 1] : ''
+      void load(cur, false)
+    } catch (e) {
+      toast((e as Error).message)
+    }
+  }
+
   const totalSize = stats.reduce((a, s) => a + s.total_size, 0)
   const totalFailed = stats.reduce((a, s) => a + s.failed, 0)
   const totalSkipped = stats.reduce((a, s) => a + s.skipped, 0)
@@ -190,10 +203,11 @@ export function History() {
                 <th>状态</th>
                 <th class="num">大小</th>
                 <th>时间</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
-              {items.map((r) => <Row key={r.id} rec={r} />)}
+              {items.map((r) => <Row key={r.id} rec={r} onDelete={del} />)}
             </tbody>
           </table>
         )}
@@ -208,7 +222,7 @@ export function History() {
   )
 }
 
-function Row({ rec }: { rec: HistoryRecord }) {
+function Row({ rec, onDelete }: { rec: HistoryRecord; onDelete: (r: HistoryRecord) => void }) {
   const cls = { completed: 'ok', failed: 'err', skipped: '' }[rec.status] || ''
   return (
     <tr>
@@ -231,6 +245,9 @@ function Row({ rec }: { rec: HistoryRecord }) {
       </td>
       <td class="num">{fmtSize(rec.file_size)}</td>
       <td class="meta">{fmtTime(rec.created_at)}</td>
+      <td>
+        <button class="sm danger" title="删除此条记录（磁盘文件保留）" onClick={() => onDelete(rec)}>删除</button>
+      </td>
     </tr>
   )
 }

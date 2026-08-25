@@ -263,6 +263,10 @@ downloads/
         └── video_4.mp4.json  # save_metadata 开启时的元数据 sidecar
 ```
 
+sidecar 内含该消息的完整信息：文案（caption）、消息 ID、可读日期（`date_text`）、
+聊天 ID/标题、发送者 ID、相册 ID、媒体类型/文件名/大小/MIME、文件唯一 ID（`unique_id`）、
+任务 ID，以及可一键跳回原消息的 `message_url`（`https://t.me/c/<聊天>/<消息>`）。
+
 ### 路径模板
 
 `download.path_template` 可自定义落盘路径。默认值即上方既有布局，不改模板则升级后文件位置不变。
@@ -282,14 +286,23 @@ downloads/
 展开为空的路径段会被丢弃，因此 `{type}` / `{album}` 能自然地「消失」。
 
 > [!CAUTION]
-> 模板必须包含 `{chat_id}`，并至少包含 `{name}` 或 `{msg_id}`：前者隔离不同聊天，
-> 后者隔离同一聊天中的不同消息。缺少任一层都会让文件互相覆盖，或被当成「已下载」而跳过。
+> 模板必须至少包含 `{chat_id}` 与 `{chat_title}` 之一（聊天隔离层），并至少包含 `{name}` 或 `{msg_id}`：
+> `{chat_id}` 或 `{chat_title}` 隔离不同聊天（`{chat_title}` 在标题缺失时自动回退为 `chat_<id>`），
+> `{name}` / `{msg_id}` 隔离同一聊天中的不同消息。缺少任一层都会让文件互相覆盖，或被当成「已下载」而跳过。
 > 非法模板会被忽略并回退到默认布局。
 
 ```yaml
 download:
   # 按 ID、标题和日期归档：downloads/123456/我的频道/2024-03-05/42_video.mp4
   path_template: "{chat_id}/{chat_title}/{date}/{name}"
+```
+
+不想看到 `chat_<id>` 这种目录名？让顶层目录直接用群聊名即可（标题缺失时仍会回退 `chat_<id>` 兜底）：
+
+```yaml
+download:
+  # 顶层目录 = 群聊名：downloads/我的频道/2024-03-05/42_video.mp4
+  path_template: "{chat_title}/{date}/{name}"
 ```
 
 ---
