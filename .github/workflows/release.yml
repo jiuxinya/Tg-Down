@@ -462,26 +462,3 @@ jobs:
             ### 🚀 使用
             1. 解压，编辑 `config.yaml` 填入 Telegram API 信息（https://my.telegram.org/apps）
             2. 运行 `./start.sh`（Windows：双击 `start.bat`）；`./tg-down --web` 启动网页管理端
-
-  dependency-submission:
-    runs-on: ubuntu-latest
-    name: Submit Dependencies for Release
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Setup TDLib
-        uses: ./.github/actions/setup-tdlib
-
-      - name: Run Go Dependency Submission
-        uses: actions/go-dependency-submission@v2
-        with:
-          go-mod-path: go.mod
-          go-build-target: ./cmd
